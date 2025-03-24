@@ -29,6 +29,7 @@ use std::{
 
 use crossbeam::atomic::AtomicCell;
 use lazy_static::lazy_static;
+use mockall::automock;
 use pd_client::{PdClient, PdFuture};
 use prometheus::{register_int_gauge, IntGauge};
 use thiserror::Error;
@@ -59,8 +60,6 @@ const DEFAULT_LIMIT_VALID_DURATION: Duration = Duration::from_secs(45);
 //    between TiKV and PD.
 pub const LIMIT_VALID_TIME_MULTIPLIER: u32 = 3;
 
-pub const DEFAULT_MAX_TS_SYNC_INTERVAL: Duration = Duration::from_secs(15);
-pub const DEFAULT_MAX_TS_DRIFT_ALLOWANCE: Duration = Duration::from_secs(60);
 const TSO_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -69,11 +68,12 @@ struct MaxTsLimit {
     update_time: Instant,
 }
 
-pub trait TsoProvider: Send + Sync {
+#[automock]
+pub trait TSOProvider: Send + Sync {
     fn get_tso(&self) -> PdFuture<TimeStamp>;
 }
 
-impl<T: PdClient> TsoProvider for T {
+impl<T: PdClient> TSOProvider for T {
     fn get_tso(&self) -> PdFuture<TimeStamp> {
         PdClient::get_tso(self)
     }
@@ -95,31 +95,46 @@ pub struct ConcurrencyManager {
     // approximate limit.
     max_ts_limit: Arc<AtomicCell<MaxTsLimit>>,
     limit_valid_duration: Duration,
-    action_on_invalid_max_ts: Arc<AtomicActionOnInvalidMaxTs>,
+    action_on_invalid_max_ts_update: Arc<AtomicActionOnInvalidMaxTs>,
 
     max_ts_drift_allowance_ms: Arc<AtomicU64>,
 
-    tso: Option<Arc<dyn TsoProvider>>,
+    tso: Option<Arc<dyn TSOProvider>>,
 
     time_provider: Arc<dyn TimeProvider>,
 }
 
 impl ConcurrencyManager {
-    pub fn new(latest_ts: TimeStamp) -> Self {
+    /// This is ONLY used in tests, please do not use it elsewhere.
+    /// To create a new concurrency manager, please use `new_with_config`
+    /// instead.
+    pub fn new_for_test(latest_ts: TimeStamp) -> Self {
         Self::new_with_config(
             latest_ts,
             DEFAULT_LIMIT_VALID_DURATION,
             ActionOnInvalidMaxTs::Panic,
             None,
-            Duration::ZERO,
+            DEFAULT_LIMIT_VALID_DURATION + Duration::from_secs(1),
+        )
+    }
+
+    /// This is ONLY used by `GcRunnerCore` as a temporary solution, please do
+    /// not use it elsewhere.
+    pub fn new_dummy() -> Self {
+        Self::new_with_config(
+            1.into(),
+            DEFAULT_LIMIT_VALID_DURATION,
+            ActionOnInvalidMaxTs::Log,
+            None,
+            DEFAULT_LIMIT_VALID_DURATION + Duration::from_secs(1),
         )
     }
 
     pub fn new_with_config(
         latest_ts: TimeStamp,
         limit_valid_duration: Duration,
-        action_on_invalid_max_ts: ActionOnInvalidMaxTs,
-        tso: Option<Arc<dyn TsoProvider>>,
+        action_on_invalid_max_ts_update: ActionOnInvalidMaxTs,
+        tso: Option<Arc<dyn TSOProvider>>,
         max_ts_drift_allowance: Duration,
     ) -> Self {
         let initial_limit = MaxTsLimit {
@@ -129,7 +144,7 @@ impl ConcurrencyManager {
 
         if limit_valid_duration >= max_ts_drift_allowance {
             error!("improper setting: limit_valid_duration >= max_ts_drift_allowance; \
-                consider increasing max-ts-drift-allowance or decreasing max-ts-sync-interval";
+                consider increasing storage.max-ts.max-drift or decreasing storage.max-ts.cache-sync-interval";
                 "limit_valid_duration" => ?limit_valid_duration,
                 "max_ts_drift_allowance" => ?max_ts_drift_allowance,
             );
@@ -139,8 +154,8 @@ impl ConcurrencyManager {
             max_ts: Arc::new(AtomicU64::new(latest_ts.into_inner())),
             max_ts_limit: Arc::new(AtomicCell::new(initial_limit)),
             lock_table: LockTable::default(),
-            action_on_invalid_max_ts: Arc::new(AtomicActionOnInvalidMaxTs::new(
-                action_on_invalid_max_ts,
+            action_on_invalid_max_ts_update: Arc::new(AtomicActionOnInvalidMaxTs::new(
+                action_on_invalid_max_ts_update,
             )),
             limit_valid_duration,
             time_provider: Arc::new(CoarseInstantTimeProvider),
@@ -155,9 +170,9 @@ impl ConcurrencyManager {
     fn new_with_time_provider(
         latest_ts: TimeStamp,
         limit_valid_duration: Duration,
-        action_on_invalid_max_ts: ActionOnInvalidMaxTs,
+        action_on_invalid_max_ts_update: ActionOnInvalidMaxTs,
         time_provider: Arc<dyn TimeProvider>,
-        tso: Option<Arc<dyn TsoProvider>>,
+        tso: Option<Arc<dyn TSOProvider>>,
         max_ts_drift_allowance: Duration,
     ) -> Self {
         let initial_limit = MaxTsLimit {
@@ -168,8 +183,8 @@ impl ConcurrencyManager {
             max_ts: Arc::new(AtomicU64::new(latest_ts.into_inner())),
             max_ts_limit: Arc::new(AtomicCell::new(initial_limit)),
             lock_table: LockTable::default(),
-            action_on_invalid_max_ts: Arc::new(AtomicActionOnInvalidMaxTs::new(
-                action_on_invalid_max_ts,
+            action_on_invalid_max_ts_update: Arc::new(AtomicActionOnInvalidMaxTs::new(
+                action_on_invalid_max_ts_update,
             )),
             limit_valid_duration,
             time_provider,
@@ -209,6 +224,7 @@ impl ConcurrencyManager {
         if !limit.limit.is_zero() && new_ts > limit.limit {
             let last_update = limit.update_time;
             let now = self.time_provider.now();
+            assert!(now >= last_update);
             let duration_to_last_limit_update = now - last_update;
 
             if duration_to_last_limit_update < self.limit_valid_duration {
@@ -304,7 +320,7 @@ impl ConcurrencyManager {
             );
         }
 
-        match self.action_on_invalid_max_ts.load() {
+        match self.action_on_invalid_max_ts_update.load() {
             ActionOnInvalidMaxTs::Panic if tso_confirmed => {
                 panic!(
                     "invalid max_ts update: {} exceeds the limit {}, source={}",
@@ -321,11 +337,13 @@ impl ConcurrencyManager {
         }
     }
 
-    /// Set the maximum allowed value for max_ts updates, except for the updates
-    /// from PD TSO. The limit must be updated regularly to prevent the
-    /// blocking of max_ts. It prevents max_ts from being updated to an
-    /// unreasonable value, which is usually caused by bugs or unsafe
-    /// usages.
+    /// Set the maximum allowed value for max_ts updates.
+    /// The actual limit is calculated by adding a drift allowance to the
+    /// provided timestamp to accommodate lag in TSO syncing.
+    /// The limit must be updated regularly to prevent failure of updating
+    /// max_ts.
+    /// It prevents max_ts from being updated to an unreasonable
+    /// value, which is usually caused by bugs or unsafe usages.
     ///
     /// # Note
     /// If the new limit is smaller than the current limit, this operation will
@@ -449,8 +467,8 @@ impl ConcurrencyManager {
         min_lock
     }
 
-    pub fn set_action_on_invalid_max_ts(&self, action: ActionOnInvalidMaxTs) {
-        self.action_on_invalid_max_ts.store(action);
+    pub fn set_action_on_invalid_max_ts_update(&self, action: ActionOnInvalidMaxTs) {
+        self.action_on_invalid_max_ts_update.store(action);
     }
 
     pub fn set_max_ts_drift_allowance(&self, allowance: Duration) {
@@ -642,39 +660,9 @@ mod tests {
         }
     }
 
-    #[derive(Clone)]
-    struct StubTsoProvider {
-        current_tso: Arc<Mutex<TimeStamp>>,
-        pending: bool,
-    }
-
-    impl StubTsoProvider {
-        fn new(start_tso: TimeStamp) -> Self {
-            StubTsoProvider {
-                current_tso: Arc::new(Mutex::new(start_tso)),
-                pending: false,
-            }
-        }
-
-        fn set_pending(&mut self) {
-            self.pending = true
-        }
-    }
-
-    impl TsoProvider for StubTsoProvider {
-        fn get_tso(&self) -> PdFuture<TimeStamp> {
-            if self.pending {
-                std::future::pending().boxed()
-            } else {
-                let current_tso = self.current_tso.lock().unwrap();
-                ready(Ok(*current_tso)).boxed()
-            }
-        }
-    }
-
     #[tokio::test]
     async fn test_lock_keys_order() {
-        let concurrency_manager = ConcurrencyManager::new(1.into());
+        let concurrency_manager = ConcurrencyManager::new_for_test(1.into());
         let keys: Vec<_> = [b"c", b"a", b"b"]
             .iter()
             .copied()
@@ -688,7 +676,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_max_ts() {
-        let concurrency_manager = ConcurrencyManager::new(10.into());
+        let concurrency_manager = ConcurrencyManager::new_for_test(10.into());
         let _ = concurrency_manager.update_max_ts(20.into(), "");
         assert_eq!(concurrency_manager.max_ts(), 20.into());
 
@@ -716,7 +704,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_global_min_lock_ts() {
-        let concurrency_manager = ConcurrencyManager::new(1.into());
+        let concurrency_manager = ConcurrencyManager::new_for_test(1.into());
 
         assert_eq!(concurrency_manager.global_min_lock_ts(), None);
         let guard = concurrency_manager.lock_key(&Key::from_raw(b"a")).await;
@@ -750,7 +738,10 @@ mod tests {
 
     #[test]
     fn test_max_ts_limit() {
-        let stub_pd = StubTsoProvider::new(160.into());
+        let mut stub_pd = MockTSOProvider::new();
+        stub_pd
+            .expect_get_tso()
+            .return_once(|| ready(Ok(160.into())).boxed());
         let stub_pd = Arc::new(stub_pd);
         let cm = ConcurrencyManager::new_with_config(
             TimeStamp::new(100),
@@ -769,6 +760,7 @@ mod tests {
         // Try to lower limit to 150 - should be ignored
         cm.set_max_ts_limit(TimeStamp::new(150));
         cm.update_max_ts(TimeStamp::new(180), "").unwrap(); // Should still work up to 200
+        assert!(cm.update_max_ts(TimeStamp::new(250), "").is_err()); // Should fail above 200
 
         // Increase limit to 300 - should work
         cm.set_max_ts_limit(TimeStamp::new(300));
@@ -777,26 +769,29 @@ mod tests {
 
     #[test]
     fn test_max_ts_limit_edge_cases() {
-        let cm = ConcurrencyManager::new(TimeStamp::new(100));
+        let cm = ConcurrencyManager::new_for_test(TimeStamp::new(100));
 
         // Test transition from zero limit
         assert_eq!(cm.max_ts_limit.load().limit, 0.into());
         cm.set_max_ts_limit(TimeStamp::new(1000));
-        assert_eq!(cm.max_ts_limit.load().limit, 1000.into());
+        assert_eq!(cm.max_ts_limit.load().limit, 12058625000.into());
 
         // Try to lower from 1000 to 500 - should be ignored
         cm.set_max_ts_limit(TimeStamp::new(500));
-        assert_eq!(cm.max_ts_limit.load().limit, 1000.into());
+        assert_eq!(cm.max_ts_limit.load().limit, 12058625000.into());
 
         // Test setting limit to max, should have no effect
         cm.set_max_ts_limit(TimeStamp::max());
-        assert_eq!(cm.max_ts_limit.load().limit, 1000.into());
+        assert_eq!(cm.max_ts_limit.load().limit, 12058625000.into());
     }
 
     #[test]
     fn test_max_ts_updates_with_monotonic_limit() {
+        let mut stub_pd = MockTSOProvider::new();
         // Assertion: should fail to update max_ts to 250 and query PD
-        let stub_pd = StubTsoProvider::new(201.into());
+        stub_pd
+            .expect_get_tso()
+            .return_once(|| ready(Ok(201.into())).boxed());
         let stub_pd = Arc::new(stub_pd);
         let cm = ConcurrencyManager::new_with_config(
             TimeStamp::new(100),
@@ -829,8 +824,11 @@ mod tests {
     fn test_limit_valid_duration_boundary() {
         let start_time = Instant::now();
         let stub_time = StubTimeProvider::new(start_time);
-        let time_provider = Arc::new(stub_time);
-        let stub_pd = StubTsoProvider::new(200.into());
+        let time_provider = Arc::new(stub_time.clone());
+        let mut stub_pd = MockTSOProvider::new();
+        stub_pd
+            .expect_get_tso()
+            .return_once(|| ready(Ok(200.into())).boxed());
         let stub_pd = Arc::new(stub_pd);
 
         let cm = ConcurrencyManager::new_with_time_provider(
@@ -845,6 +843,7 @@ mod tests {
         cm.set_max_ts_limit(TimeStamp::new(200));
 
         time_provider.advance(Duration::from_secs(59));
+        assert!(cm.update_max_ts(TimeStamp::new(250), "").is_err());
 
         time_provider.advance(Duration::from_secs(1));
         cm.update_max_ts(TimeStamp::new(250), "").unwrap();
@@ -861,7 +860,7 @@ mod tests {
             TimeStamp::new(100),
             Duration::from_secs(60),
             ActionOnInvalidMaxTs::Error,
-            time_provider,
+            time_provider.clone(),
             None,
             Duration::ZERO,
         );
@@ -879,7 +878,10 @@ mod tests {
     #[test]
     #[should_panic(expected = "invalid max_ts update")]
     fn test_panic_on_invalid_max_ts_enabled() {
-        let stub_pd = StubTsoProvider::new(201.into());
+        let mut stub_pd = MockTSOProvider::new();
+        stub_pd
+            .expect_get_tso()
+            .return_once(|| ready(Ok(201.into())).boxed());
         let stub_pd = Arc::new(stub_pd);
         let cm = ConcurrencyManager::new_with_config(
             TimeStamp::new(100),
@@ -891,14 +893,14 @@ mod tests {
 
         cm.set_max_ts_limit(TimeStamp::new(200));
 
-        // should not panic
+        // should panic
         cm.update_max_ts(TimeStamp::new(250), "test_source".to_string())
             .unwrap();
     }
 
     #[test]
     fn test_update_max_ts_without_limit() {
-        let cm = ConcurrencyManager::new(TimeStamp::new(100));
+        let cm = ConcurrencyManager::new_for_test(TimeStamp::new(100));
 
         cm.update_max_ts(TimeStamp::new(500), "test_source".to_string())
             .unwrap();
@@ -907,14 +909,17 @@ mod tests {
 
     #[test]
     fn test_pd_tso_jump_not_panic() {
+        let mut stub_pd = MockTSOProvider::new();
         // The double check procedure gets latest_ts=300 from TSO
-        let stub_pd = StubTsoProvider::new(300.into());
+        stub_pd
+            .expect_get_tso()
+            .return_once(|| ready(Ok(300.into())).boxed());
         let stub_pd = Arc::new(stub_pd);
         let cm = ConcurrencyManager::new_with_config(
             TimeStamp::new(100),
             DEFAULT_LIMIT_VALID_DURATION,
             ActionOnInvalidMaxTs::Panic,
-            Some(stub_pd),
+            Some(stub_pd.clone()),
             Duration::ZERO,
         );
 
@@ -926,15 +931,17 @@ mod tests {
 
     #[test]
     fn test_do_not_panic_under_pd_tso_jump_and_network_partition() {
-        let mut stub_pd = StubTsoProvider::new(300.into());
-        stub_pd.set_pending();
+        let mut stub_pd = MockTSOProvider::new();
         // Network partition between PD and TiKV
+        stub_pd
+            .expect_get_tso()
+            .return_once(|| std::future::pending().boxed());
         let stub_pd = Arc::new(stub_pd);
         let cm = ConcurrencyManager::new_with_config(
             TimeStamp::new(100),
             DEFAULT_LIMIT_VALID_DURATION,
             ActionOnInvalidMaxTs::Panic,
-            Some(stub_pd),
+            Some(stub_pd.clone()),
             Duration::ZERO,
         );
         cm.set_max_ts_limit(200.into());

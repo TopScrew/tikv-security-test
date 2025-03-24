@@ -4,6 +4,7 @@
 
 use std::{convert::TryInto, sync::Arc};
 
+use concurrency_manager::ConcurrencyManager;
 use engine_traits::{ALL_CFS, CF_DEFAULT};
 use file_system::{get_io_rate_limiter, IoPriority, IoType};
 use online_config::{ConfigChange, ConfigManager, ConfigValue, Result as CfgResult};
@@ -25,6 +26,7 @@ pub struct StorageConfigManger<E: Engine, K, L: LockManager> {
     ttl_checker_scheduler: Scheduler<TtlCheckerTask>,
     flow_controller: Arc<FlowController>,
     scheduler: TxnScheduler<E, L>,
+    concurrency_manager: ConcurrencyManager,
 }
 
 unsafe impl<E: Engine, K, L: LockManager> Send for StorageConfigManger<E, K, L> {}
@@ -36,12 +38,14 @@ impl<E: Engine, K, L: LockManager> StorageConfigManger<E, K, L> {
         ttl_checker_scheduler: Scheduler<TtlCheckerTask>,
         flow_controller: Arc<FlowController>,
         scheduler: TxnScheduler<E, L>,
+        concurrency_manager: ConcurrencyManager,
     ) -> Self {
         StorageConfigManger {
             configurable_db,
             ttl_checker_scheduler,
             flow_controller,
             scheduler,
+            concurrency_manager,
         }
     }
 }
@@ -67,8 +71,11 @@ impl<EK: Engine, K: ConfigurableDb, L: LockManager> ConfigManager
             self.ttl_checker_scheduler
                 .schedule(TtlCheckerTask::UpdatePollInterval(interval.into()))
                 .unwrap();
-        } else if let Some(ConfigValue::Module(mut flow_control)) = change.remove("flow_control") {
-            if let Some(v) = flow_control.remove("enable") {
+        } else if let Some(ConfigValue::Module(flow_control)) = change.remove("flow_control") {
+            // we first update the config here then trigger the side-effect of
+            // `flow-control.enable`.
+            self.flow_controller.update_config(flow_control.clone())?;
+            if let Some(v) = flow_control.get("enable") {
                 let enable: bool = v.into();
                 let enable_str = if enable { "true" } else { "false" };
                 for cf in ALL_CFS {
@@ -81,6 +88,9 @@ impl<EK: Engine, K: ConfigurableDb, L: LockManager> ConfigManager
         } else if let Some(v) = change.get("scheduler_worker_pool_size") {
             let pool_size: usize = v.into();
             self.scheduler.scale_pool_size(pool_size);
+        } else if let Some(v) = change.remove("memory_quota") {
+            let cap: ReadableSize = v.into();
+            self.scheduler.set_memory_quota_capacity(cap.0 as usize);
         }
         if let Some(ConfigValue::Module(mut io_rate_limit)) = change.remove("io_rate_limit") {
             let limiter = match get_io_rate_limiter() {
@@ -100,6 +110,19 @@ impl<EK: Engine, K: ConfigurableDb, L: LockManager> ConfigManager
                 }
             }
         }
+        if let Some(ConfigValue::Module(mut max_ts)) = change.remove("max_ts") {
+            if let Some(v) = max_ts.remove("action_on_invalid_update") {
+                let str_v: String = v.into();
+                let action: concurrency_manager::ActionOnInvalidMaxTs = str_v.try_into()?;
+                self.concurrency_manager
+                    .set_action_on_invalid_max_ts_update(action);
+            }
+            if let Some(v) = max_ts.remove("max_drift") {
+                let dur_v: ReadableDuration = v.into();
+                self.concurrency_manager.set_max_ts_drift_allowance(dur_v.0);
+            }
+        }
+
         Ok(())
     }
 }

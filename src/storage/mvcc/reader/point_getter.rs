@@ -365,6 +365,12 @@ impl<S: Snapshot> PointGetter<S> {
         write_start_ts: TimeStamp,
         user_key: &Key,
     ) -> Result<Value> {
+        fail_point!("load_data_from_default_cf_default_not_found", |_| Err(
+            default_not_found_error(
+                user_key.clone().append_ts(write_start_ts).into_encoded(),
+                "load_data_from_default_cf",
+            )
+        ));
         self.statistics.data.get += 1;
         // TODO: We can avoid this clone.
         let value = self
@@ -1287,7 +1293,7 @@ mod tests {
         let k = b"k";
 
         // Write enough LOCK recrods
-        for start_ts in (1..30).into_iter().step_by(2) {
+        for start_ts in (1..30).step_by(2) {
             must_prewrite_lock(&mut engine, k, k, start_ts);
             must_commit(&mut engine, k, start_ts, start_ts + 1);
         }

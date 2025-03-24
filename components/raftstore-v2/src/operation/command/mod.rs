@@ -137,7 +137,7 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
         };
         let logger = self.logger.clone();
         let read_scheduler = self.storage().read_scheduler();
-        let buckets = self.region_buckets_info().bucket_stat().clone();
+        let buckets = self.region_buckets_info().bucket_stat().cloned();
         let sst_apply_state = self.sst_apply_state().clone();
         let (apply_scheduler, mut apply_fsm) = ApplyFsm::new(
             &store_ctx.cfg,
@@ -343,7 +343,9 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
         if !queue.is_empty() {
             for e in committed_entries {
                 let mut proposal = queue.find_proposal(e.term, e.index, current_term);
-                if let Some(p) = &mut proposal && p.must_pass_epoch_check {
+                if let Some(p) = &mut proposal
+                    && p.must_pass_epoch_check
+                {
                     // In this case the apply can be guaranteed to be successful. Invoke the
                     // on_committed callback if necessary.
                     p.cb.notify_committed();
@@ -445,14 +447,19 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
         self.proposal_control_advance_apply(apply_res.applied_index);
         let is_leader = self.is_leader();
         let progress_to_be_updated = self.entry_storage().applied_term() != apply_res.applied_term;
+
+        let mut cache_warmup_state = self.transfer_leader_state_mut().cache_warmup_state.take();
         let entry_storage = self.entry_storage_mut();
         entry_storage
             .apply_state_mut()
             .set_applied_index(apply_res.applied_index);
         entry_storage.set_applied_term(apply_res.applied_term);
         if !is_leader {
-            entry_storage.compact_entry_cache(apply_res.applied_index + 1);
+            entry_storage
+                .compact_entry_cache(apply_res.applied_index + 1, cache_warmup_state.as_mut());
         }
+        self.transfer_leader_state_mut().cache_warmup_state = cache_warmup_state;
+
         if is_leader {
             self.retry_pending_prepare_merge(ctx, apply_res.applied_index);
         }
@@ -536,7 +543,7 @@ impl<EK: KvEngine, R: ApplyResReporter> Apply<EK, R> {
     pub async fn apply_unsafe_write(&mut self, data: Box<[u8]>) {
         let decoder = match SimpleWriteReqDecoder::new(
             |buf, index, term| parse_at(&self.logger, buf, index, term),
-            &self.logger,
+            Some(&self.logger),
             &data,
             u64::MAX,
             u64::MAX,
@@ -644,7 +651,7 @@ impl<EK: KvEngine, R: ApplyResReporter> Apply<EK, R> {
         let req = match entry.get_entry_type() {
             EntryType::EntryNormal => match SimpleWriteReqDecoder::new(
                 |buf, index, term| parse_at(&self.logger, buf, index, term),
-                &self.logger,
+                Some(&self.logger),
                 entry.get_data(),
                 log_index,
                 entry.get_term(),
@@ -844,12 +851,14 @@ impl<EK: KvEngine, R: ApplyResReporter> Apply<EK, R> {
         }
         control.need_flush = false;
         let flush_state = self.flush_state().clone();
-        if let Some(wb) = &self.write_batch && !wb.is_empty() {
+        if let Some(wb) = &self.write_batch
+            && !wb.is_empty()
+        {
             self.perf_context().start_observe();
             let mut write_opt = WriteOptions::default();
             write_opt.set_disable_wal(true);
             let wb = self.write_batch.as_mut().unwrap();
-            if let Err(e) = wb.write_callback_opt(&write_opt, || {
+            if let Err(e) = wb.write_callback_opt(&write_opt, |_| {
                 flush_state.set_applied_index(index);
             }) {
                 slog_panic!(self.logger, "failed to write data"; "error" => ?e);
@@ -864,10 +873,7 @@ impl<EK: KvEngine, R: ApplyResReporter> Apply<EK, R> {
             let tokens: Vec<_> = self
                 .callbacks_mut()
                 .iter()
-                .flat_map(|(v, _)| {
-                    v.write_trackers()
-                        .flat_map(|t| t.as_tracker_token())
-                })
+                .flat_map(|(v, _)| v.write_trackers().flat_map(|t| t.as_tracker_token()))
                 .collect();
             self.perf_context().report_metrics(&tokens);
         }

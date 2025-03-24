@@ -6,7 +6,10 @@ use std::{
     cell::RefCell,
     cmp::Ordering,
     ops::{Add, AddAssign, Sub, SubAssign},
-    sync::mpsc::{self, Sender},
+    sync::{
+        mpsc::{self, Sender},
+        Once,
+    },
     thread::{self, Builder, JoinHandle},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -14,19 +17,34 @@ use std::{
 use async_speed_limit::clock::{BlockingClock, Clock, StandardClock};
 use time::{Duration as TimeDuration, Timespec};
 
+/// Returns the monotonic raw time since some unspecified starting point.
+pub use self::inner::monotonic_raw_now;
+pub use self::inner::{monotonic_coarse_now, monotonic_now};
+use crate::sys::thread::StdThreadBuildWrapper;
+
+const NANOSECONDS_PER_SECOND: u64 = 1_000_000_000;
+const MILLISECONDS_PER_SECOND: u64 = 1_000;
+const MICROSECONDS_PER_SECOND: u64 = 1_000_000;
+const NANOSECONDS_PER_MILLISECOND: u64 = 1_000_000;
+const NANOSECONDS_PER_MICROSECOND: u64 = 1_000;
+
 /// Converts Duration to milliseconds.
 #[inline]
 pub fn duration_to_ms(d: Duration) -> u64 {
     let nanos = u64::from(d.subsec_nanos());
     // If Duration is too large, the result may be overflow.
-    d.as_secs() * 1_000 + (nanos / 1_000_000)
+    d.as_secs() * MILLISECONDS_PER_SECOND + (nanos / NANOSECONDS_PER_MILLISECOND)
 }
 
 /// Converts Duration to seconds.
 #[inline]
 pub fn duration_to_sec(d: Duration) -> f64 {
     let nanos = f64::from(d.subsec_nanos());
-    d.as_secs() as f64 + (nanos / 1_000_000_000.0)
+    d.as_secs() as f64 + (nanos / NANOSECONDS_PER_SECOND as f64)
+}
+
+pub fn nanos_to_secs(nanos: u64) -> f64 {
+    nanos as f64 / NANOSECONDS_PER_SECOND as f64
 }
 
 /// Converts Duration to microseconds.
@@ -34,7 +52,7 @@ pub fn duration_to_sec(d: Duration) -> f64 {
 pub fn duration_to_us(d: Duration) -> u64 {
     let nanos = u64::from(d.subsec_nanos());
     // If Duration is too large, the result may be overflow.
-    d.as_secs() * 1_000_000 + (nanos / 1_000)
+    d.as_secs() * MICROSECONDS_PER_SECOND + (nanos / NANOSECONDS_PER_MICROSECOND)
 }
 
 /// Converts TimeSpec to nanoseconds
@@ -48,7 +66,7 @@ pub fn timespec_to_ns(t: Timespec) -> u64 {
 pub fn duration_to_ns(d: Duration) -> u64 {
     let nanos = u64::from(d.subsec_nanos());
     // If Duration is too large, the result may be overflow.
-    d.as_secs() * 1_000_000_000 + nanos
+    d.as_secs() * NANOSECONDS_PER_SECOND + nanos
 }
 
 pub trait InstantExt {
@@ -199,15 +217,6 @@ impl Drop for Monitor {
         }
     }
 }
-
-/// Returns the monotonic raw time since some unspecified starting point.
-pub use self::inner::monotonic_raw_now;
-pub use self::inner::{monotonic_coarse_now, monotonic_now};
-use crate::sys::thread::StdThreadBuildWrapper;
-
-const NANOSECONDS_PER_SECOND: u64 = 1_000_000_000;
-const MILLISECOND_PER_SECOND: i64 = 1_000;
-const NANOSECONDS_PER_MILLISECOND: i64 = 1_000_000;
 
 #[cfg(not(target_os = "linux"))]
 mod inner {
@@ -387,10 +396,10 @@ impl Instant {
         later: Timespec,
         earlier: Timespec,
     ) -> Duration {
-        let later_ms = later.sec * MILLISECOND_PER_SECOND
-            + i64::from(later.nsec) / NANOSECONDS_PER_MILLISECOND;
-        let earlier_ms = earlier.sec * MILLISECOND_PER_SECOND
-            + i64::from(earlier.nsec) / NANOSECONDS_PER_MILLISECOND;
+        let later_ms = later.sec * MILLISECONDS_PER_SECOND as i64
+            + i64::from(later.nsec) / NANOSECONDS_PER_MILLISECOND as i64;
+        let earlier_ms = earlier.sec * MILLISECONDS_PER_SECOND as i64
+            + i64::from(earlier.nsec) / NANOSECONDS_PER_MILLISECOND as i64;
         let dur = later_ms - earlier_ms;
         if dur >= 0 {
             Duration::from_millis(dur as u64)
@@ -510,7 +519,7 @@ pub struct ThreadReadId {
     pub create_time: Timespec,
 }
 
-thread_local!(static READ_SEQUENCE: RefCell<u64> = RefCell::new(0));
+thread_local!(static READ_SEQUENCE: RefCell<u64> = const { RefCell::new(0) });
 
 impl ThreadReadId {
     pub fn new() -> ThreadReadId {
@@ -529,6 +538,55 @@ impl ThreadReadId {
 impl Default for ThreadReadId {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Default duration cost for spinning one round.
+///
+/// Heuristically, spin duration for one round is about 3～4ns.
+static mut DEFAULT_DURATION_SPIN_ONE_ROUND: u64 = 1;
+
+/// Setup the default ratio for spin duration.
+pub fn setup_for_spin_interval() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let inspect_duration = Duration::from_millis(10);
+        let start = Instant::now();
+        let mut count = 0;
+        // Spin for a while to get the duration for one round.
+        for _ in 0..2_097_152 {
+            count += 1;
+            if count % 1024 == 0 && start.saturating_elapsed() >= inspect_duration {
+                break;
+            }
+        }
+        let elapsed_one_round = start.saturating_elapsed().as_nanos() as u64 / count;
+        if elapsed_one_round > 0 {
+            unsafe {
+                DEFAULT_DURATION_SPIN_ONE_ROUND = elapsed_one_round;
+            }
+        }
+        debug!("setup duration for spinning one round: {}ns", unsafe {
+            DEFAULT_DURATION_SPIN_ONE_ROUND
+        });
+    });
+}
+
+/// Wait for at least `elaspsed` duration synchronously by looping.
+///
+/// Attention, this function is only suitable for short-time spinning, so
+/// the `elaspsed` should be small, like 1ms. And the caller should not
+/// rely on it to guarantee the exact time to sleep.
+pub fn spin_at_least(elaspsed: Duration) {
+    // Initialize default spin loop interval.
+    setup_for_spin_interval();
+
+    let rounds = unsafe { elaspsed.as_nanos() as u64 / DEFAULT_DURATION_SPIN_ONE_ROUND };
+    let now = Instant::now();
+    for i in 1..=rounds {
+        if i % 100 == 0 && now.saturating_elapsed() >= elaspsed {
+            return;
+        }
     }
 }
 
@@ -584,6 +642,16 @@ mod tests {
             assert_eq!(ms * 1_000, duration_to_us(d));
             assert_eq!(ms * 1_000_000, duration_to_ns(d));
         }
+    }
+
+    #[test]
+    fn test_nanos_to_secs() {
+        assert_eq!(nanos_to_secs(0), 0.0);
+        assert_eq!(nanos_to_secs(1), 1e-9);
+        assert_eq!(nanos_to_secs(NANOSECONDS_PER_SECOND), 1.0);
+        assert_eq!(nanos_to_secs(1_500_000_000), 1.5);
+        // Test with a large number of nanoseconds (e.g., 10 billion ns = 10 seconds)
+        assert_eq!(nanos_to_secs(10 * NANOSECONDS_PER_SECOND), 10.0);
     }
 
     #[test]
@@ -685,6 +753,15 @@ mod tests {
             assert!(now.saturating_elapsed() >= zero);
             assert!(now_coarse.saturating_elapsed() >= zero);
         }
+    }
+
+    #[test]
+    fn test_wait_at_least() {
+        setup_for_spin_interval();
+
+        let start = Instant::now();
+        spin_at_least(Duration::from_micros(500));
+        assert!(start.saturating_elapsed() >= Duration::from_micros(100));
     }
 
     #[bench]

@@ -1,6 +1,6 @@
 <img src="images/tikv-logo.png" alt="tikv_logo" width="300"/>
 
-## [Website](https://tikv.org) | [Documentation](https://tikv.org/docs/latest/concepts/overview/) | [Community Chat](https://tikv.org/chat)
+## [Website](https://tikv.org) | [Documentation](https://tikv.org/docs/latest/concepts/overview/) | [Community Chat](https://slack.tidb.io/invite?team=tikv-wg&channel=general)
 
 [![Build Status](https://ci.pingcap.net/buildStatus/icon?job=tikv_ghpr_build_master)](https://ci.pingcap.net/blue/organizations/jenkins/tikv_ghpr_build_master/activity)
 [![Coverage Status](https://codecov.io/gh/tikv/tikv/branch/master/graph/badge.svg)](https://codecov.io/gh/tikv/tikv)
@@ -85,7 +85,7 @@ TiKV is able to run separately with PD, which is the minimal deployment required
 1. Download and extract binaries.
 
 ```bash
-$ export TIKV_VERSION=v4.0.12
+$ export TIKV_VERSION=v7.5.0
 $ export GOOS=darwin  # only {darwin, linux} are supported
 $ export GOARCH=amd64 # only {amd64, arm64} are supported
 $ curl -O  https://tiup-mirrors.pingcap.com/tikv-$TIKV_VERSION-$GOOS-$GOARCH.tar.gz

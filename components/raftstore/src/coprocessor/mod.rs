@@ -19,6 +19,7 @@ use kvproto::{
     },
     raft_serverpb::RaftApplyState,
 };
+use pd_client::RegionStat;
 use raft::{eraftpb, StateRole};
 
 pub mod config;
@@ -30,17 +31,22 @@ pub mod region_info_accessor;
 mod split_check;
 pub mod split_observer;
 use kvproto::raft_serverpb::RaftMessage;
+mod read_write;
 
 pub use self::{
     config::{Config, ConsistencyCheckMethod},
     consistency_check::{ConsistencyCheckObserver, Raw as RawConsistencyCheckObserver},
     dispatcher::{
         BoxAdminObserver, BoxApplySnapshotObserver, BoxCmdObserver, BoxConsistencyCheckObserver,
-        BoxMessageObserver, BoxPdTaskObserver, BoxQueryObserver, BoxRegionChangeObserver,
+        BoxPdTaskObserver, BoxQueryObserver, BoxRaftMessageObserver, BoxRegionChangeObserver,
         BoxRoleObserver, BoxSplitCheckObserver, BoxUpdateSafeTsObserver, CoprocessorHost, Registry,
         StoreHandle,
     },
     error::{Error, Result},
+    read_write::{
+        ObservableWriteBatch, ObservedSnapshot, SnapshotObserver, WriteBatchObserver,
+        WriteBatchWrapper,
+    },
     region_info_accessor::{
         Callback as RegionInfoCallback, RangeKey, RegionCollector, RegionInfo, RegionInfoAccessor,
         RegionInfoProvider, SeekRegionCallback,
@@ -86,6 +92,7 @@ pub struct RegionState {
     pub peer_id: u64,
     pub pending_remove: bool,
     pub modified_region: Option<Region>,
+    pub new_regions: Vec<Region>,
 }
 
 /// Context for exec observers of mutation to be applied to ApplyContext.
@@ -132,14 +139,6 @@ pub trait AdminObserver: Coprocessor {
         _: &mut ApplyCtxInfo<'_>,
     ) -> bool {
         false
-    }
-
-    fn pre_transfer_leader(
-        &self,
-        _ctx: &mut ObserverContext<'_>,
-        _tr: &TransferLeaderRequest,
-    ) -> Result<()> {
-        Ok(())
     }
 }
 
@@ -288,8 +287,7 @@ pub struct RoleChange {
 }
 
 impl RoleChange {
-    #[cfg(any(test, feature = "testexport"))]
-    pub fn new(state: StateRole) -> Self {
+    pub fn new_for_test(state: StateRole) -> Self {
         RoleChange {
             state,
             leader_id: raft::INVALID_ID,
@@ -351,8 +349,11 @@ pub trait RegionChangeObserver: Coprocessor {
         true
     }
 }
+pub trait RegionHeartbeatObserver: Coprocessor {
+    fn on_region_heartbeat(&self, _: &mut ObserverContext<'_>, _: &RegionStat) {}
+}
 
-pub trait MessageObserver: Coprocessor {
+pub trait RaftMessageObserver: Coprocessor {
     /// Returns false if the message should not be stepped later.
     fn on_raft_message(&self, _: &RaftMessage) -> bool {
         true
@@ -594,6 +595,51 @@ pub trait ReadIndexObserver: Coprocessor {
 pub trait UpdateSafeTsObserver: Coprocessor {
     /// Hook after update self safe_ts and received leader safe_ts.
     fn on_update_safe_ts(&self, _: u64, _: u64, _: u64) {}
+}
+
+pub trait DestroyPeerObserver: Coprocessor {
+    /// Hook to call when destroying a peer.
+    fn on_destroy_peer(&self, _: &Region) {}
+}
+
+#[derive(PartialEq)]
+pub struct TransferLeaderCustomContext {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+}
+
+impl fmt::Debug for TransferLeaderCustomContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TransferLeaderCustomContext")
+            .field("key", &log_wrappers::Value(&self.key))
+            .field("value", &log_wrappers::Value(&self.value))
+            .finish()
+    }
+}
+
+pub trait TransferLeaderObserver: Coprocessor {
+    /// Hook to call before proposing transfer leader request.
+    /// The return value is a custom context which will be set as the context
+    /// of the transfer leader request.
+    ///
+    /// Called by a leader.
+    fn pre_transfer_leader(
+        &self,
+        _ctx: &mut ObserverContext<'_>,
+        _tr: &TransferLeaderRequest,
+    ) -> Result<Option<TransferLeaderCustomContext>> {
+        Ok(None)
+    }
+
+    /// Hook to call after acknowledging a transfer leader request.
+    /// Implementations can decode the custom context from the transfer leader
+    /// request and initiates necessary preparations.
+    /// Return false to delay acknowledging the transfer leader request.
+    ///
+    /// Called by a leader transferee.
+    fn pre_ack_transfer_leader(&self, _: &mut ObserverContext<'_>, _: &eraftpb::Message) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

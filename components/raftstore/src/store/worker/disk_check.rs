@@ -8,13 +8,12 @@ use std::{
 };
 
 use crossbeam::channel::{bounded, Receiver, Sender};
+use health_controller::types::LatencyInspector;
 use tikv_util::{
     time::Instant,
     warn,
     worker::{Runnable, Worker},
 };
-
-use crate::store::util::LatencyInspector;
 
 #[derive(Debug)]
 pub enum Task {
@@ -127,6 +126,14 @@ impl Runnable for Runner {
                     runner.execute();
                 });
             }
+        }
+    }
+}
+
+impl Drop for Runner {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.target) {
+            warn!("remove disk latency inspector file failed"; "err" => ?e);
         }
     }
 }

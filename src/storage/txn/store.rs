@@ -655,7 +655,7 @@ mod tests {
     use std::sync::Arc;
 
     use concurrency_manager::ConcurrencyManager;
-    use engine_traits::{CfName, IterOptions, ReadOptions};
+    use engine_traits::{CfName, IterMetricsCollector, IterOptions, MetricsExt, ReadOptions};
     use kvproto::kvrpcpb::{AssertionLevel, Context, PrewriteRequestPessimisticAction::*};
     use tikv_kv::DummySnapshotExt;
 
@@ -706,7 +706,7 @@ mod tests {
 
             // do prewrite.
             {
-                let cm = ConcurrencyManager::new(START_TS);
+                let cm = ConcurrencyManager::new_for_test(START_TS);
                 let mut txn = MvccTxn::new(START_TS, cm);
                 let mut reader = SnapshotReader::new(START_TS, self.snapshot.clone(), true);
                 for key in &self.keys {
@@ -740,7 +740,7 @@ mod tests {
             self.refresh_snapshot();
             // do commit
             {
-                let cm = ConcurrencyManager::new(START_TS);
+                let cm = ConcurrencyManager::new_for_test(START_TS);
                 let mut txn = MvccTxn::new(START_TS, cm);
                 let mut reader = SnapshotReader::new(START_TS, self.snapshot.clone(), true);
                 for key in &self.keys {
@@ -815,6 +815,26 @@ mod tests {
         }
         fn value(&self) -> &[u8] {
             b""
+        }
+    }
+
+    pub struct MockRangeSnapIterMetricsCollector;
+
+    impl IterMetricsCollector for MockRangeSnapIterMetricsCollector {
+        fn internal_delete_skipped_count(&self) -> u64 {
+            0
+        }
+
+        fn internal_key_skipped_count(&self) -> u64 {
+            0
+        }
+    }
+
+    impl MetricsExt for MockRangeSnapshotIter {
+        type Collector = MockRangeSnapIterMetricsCollector;
+
+        fn metrics_collector(&self) -> Self::Collector {
+            MockRangeSnapIterMetricsCollector {}
         }
     }
 

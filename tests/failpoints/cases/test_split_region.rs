@@ -17,7 +17,7 @@ use kvproto::{
         Mutation, Op, PessimisticLockRequest, PrewriteRequest, PrewriteRequestPessimisticAction::*,
     },
     metapb::Region,
-    pdpb::CheckPolicy,
+    pdpb::{self, CheckPolicy},
     raft_serverpb::{PeerState, RaftMessage},
     tikvpb::TikvClient,
 };
@@ -75,7 +75,7 @@ fn test_meta_inconsistency() {
     let region = cluster.get_region(b"");
     cluster.must_split(&region, b"k5");
 
-    // Scheduler a larger peed id heartbeat msg to trigger peer destroy for peer
+    // Scheduler a larger peer id heartbeat msg to trigger peer destroy for peer
     // 1003, pause it before the meta.lock operation so new region insertions by
     // region split could go first.
     // Thus a inconsistency could happen because the destroy is handled
@@ -722,7 +722,7 @@ fn test_split_continue_when_destroy_peer_after_mem_check() {
     })
     .unwrap();
 
-    // Resum region 1000 processing and wait till it's destroyed.
+    // Resume region 1000 processing and wait till it's destroyed.
     fail::remove(before_check_snapshot_1000_2_fp);
     destroy_rx.recv_timeout(Duration::from_secs(3)).unwrap();
 
@@ -1161,6 +1161,8 @@ fn test_split_with_concurrent_pessimistic_locking() {
 
 #[test]
 fn test_split_pessimistic_locks_with_concurrent_prewrite() {
+    let peer_size_limit = 512 << 10;
+    let instance_size_limit = 100 << 20;
     let mut cluster = new_server_cluster(0, 2);
     cluster.cfg.pessimistic_txn.pipelined = true;
     cluster.cfg.pessimistic_txn.in_memory = true;
@@ -1216,10 +1218,11 @@ fn test_split_pessimistic_locks_with_concurrent_prewrite() {
     {
         let mut locks = txn_ext.pessimistic_locks.write();
         locks
-            .insert(vec![
-                (Key::from_raw(b"a"), lock_a),
-                (Key::from_raw(b"c"), lock_c),
-            ])
+            .insert(
+                vec![(Key::from_raw(b"a"), lock_a), (Key::from_raw(b"c"), lock_c)],
+                peer_size_limit,
+                instance_size_limit,
+            )
             .unwrap();
     }
 
@@ -1535,8 +1538,7 @@ impl Filter for TeeFilter {
 // 2. the splitted region set has_dirty_data be true in `apply_snapshot`
 // 3. the splitted region schedule tablet trim task in `on_applied_snapshot`
 //    with tablet index 5
-// 4. the splitted region received a snapshot sent from its
-//    leader
+// 4. the splitted region received a snapshot sent from its leader
 // 5. after finishing applying this snapshot, the tablet index in storage
 //    changed to 6
 // 6. tablet trim complete and callbacked to raftstore
@@ -1612,6 +1614,10 @@ fn test_not_reset_has_dirty_data_due_to_slow_split() {
 fn test_split_region_with_no_valid_split_keys() {
     let mut cluster = test_raftstore::new_node_cluster(0, 3);
     cluster.cfg.coprocessor.region_split_size = Some(ReadableSize::kb(1));
+    // `region_split_check_diff` must be set as well after adjusting
+    // `region_split_size`. Otherwise, split checks may be skipped and a split
+    // may not be triggered as expected.
+    cluster.cfg.raft_store.region_split_check_diff = Some(ReadableSize::kb(1));
     cluster.cfg.raft_store.split_region_check_tick_interval = ReadableDuration::millis(500);
     cluster.run();
 
@@ -1719,6 +1725,68 @@ fn test_split_by_split_check_on_keys() {
     put_till_count(&mut cluster, region_max_keys / 2 + 3, &mut range);
     // waiting the split,
     cluster.wait_region_split(&region);
+}
+
+fn change(name: &str, value: &str) -> std::collections::HashMap<String, String> {
+    let mut m = std::collections::HashMap::new();
+    m.insert(name.to_owned(), value.to_owned());
+    m
+}
+
+#[test]
+fn test_turn_off_manual_compaction_caused_by_no_valid_split_key() {
+    let mut cluster = new_node_cluster(0, 1);
+    cluster.run();
+    let r = cluster.get_region(b"");
+    cluster.must_split(&r, b"k1");
+    let r = cluster.get_region(b"k1");
+    cluster.must_split(&r, b"k2");
+    cluster.must_put(b"k1", b"val");
+
+    let (tx, rx) = sync_channel(5);
+    fail::cfg_callback("on_compact_range_cf", move || {
+        tx.send(true).unwrap();
+    })
+    .unwrap();
+
+    let safe_point_inject = "safe_point_inject";
+    fail::cfg(safe_point_inject, "return(100)").unwrap();
+
+    {
+        let sim = cluster.sim.rl();
+        let cfg_controller = sim.get_cfg_controller(1).unwrap();
+        cfg_controller
+            .update(change(
+                "raftstore.skip-manual-compaction-in-clean_up-worker",
+                "true",
+            ))
+            .unwrap();
+    }
+
+    let r = cluster.get_region(b"k1");
+    cluster
+        .pd_client
+        .split_region(r.clone(), pdpb::CheckPolicy::Usekey, vec![b"k1".to_vec()]);
+    rx.recv_timeout(Duration::from_secs(1)).unwrap_err();
+
+    {
+        let sim = cluster.sim.rl();
+        let cfg_controller = sim.get_cfg_controller(1).unwrap();
+        cfg_controller
+            .update(change(
+                "raftstore.skip-manual-compaction-in-clean_up-worker",
+                "false",
+            ))
+            .unwrap();
+    }
+
+    cluster
+        .pd_client
+        .split_region(r, pdpb::CheckPolicy::Usekey, vec![b"k1".to_vec()]);
+    fail::cfg(safe_point_inject, "return(200)").unwrap();
+    rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    rx.try_recv().unwrap_err();
 }
 
 /// Test that if the original leader of the parent region is tranfered to
@@ -1855,4 +1923,58 @@ fn test_region_split_after_new_leader_elected() {
         new_region_leader
     );
     fail::remove(skip_clear_uncampaign);
+}
+
+// Test that during a split, if a new peer hasn't been created it should always
+// be marked as a pending peer in the region heartbeat.
+#[test]
+fn test_pending_peer_in_heartbeat_during_split() {
+    let mut cluster = new_node_cluster(0, 3);
+    configure_for_merge(&mut cluster.cfg);
+    cluster.cfg.raft_store.store_batch_system.max_batch_size = Some(1);
+    cluster.cfg.raft_store.store_batch_system.pool_size = 1;
+    let pd_client = Arc::clone(&cluster.pd_client);
+    pd_client.disable_default_operator();
+
+    cluster.run();
+
+    let pd_client_clone: Arc<test_pd_client::TestPdClient> = pd_client.clone();
+    // Pause at the following failpoint so that peer 3 won't be able to split
+    // and thus the new peer 1003 won't be created. Peer 1003 should always be
+    // pending in the region heartbeat uploaded to PD.
+    let apply_before_split_1_3_fp = "apply_before_split_1_3";
+    fail::cfg(apply_before_split_1_3_fp, "pause").unwrap();
+    let finish_hb_fp = "test_pd_client::finish_region_heartbeat";
+    fail::cfg_callback(finish_hb_fp, move || {
+        let region_id = 1000;
+        // Check the heartbeat of new region to see if it has been created.
+        if pd_client_clone
+            .get_region_last_report_ts(region_id)
+            .is_some()
+        {
+            let region = pd_client_clone.get_region(b"k1").unwrap();
+            assert!(region.id == region_id);
+            let new_peer_on_store_3 = find_peer(&region, 3).unwrap();
+
+            let pending_peers = pd_client_clone.get_pending_peers();
+            if !pending_peers.contains_key(&new_peer_on_store_3.id) {
+                panic!("peer {} should still be pending", new_peer_on_store_3.id);
+            }
+        }
+    })
+    .unwrap();
+
+    let region = pd_client.get_region(b"k1").unwrap();
+    let peer_1 = find_peer(&region, 1).unwrap().to_owned();
+    // region 1, leader is peer 1.
+    cluster.must_transfer_leader(region.get_id(), peer_1);
+
+    cluster.must_split(&region, b"k2");
+    cluster.must_put(b"k1", b"v1");
+    cluster.must_put(b"k3", b"v3");
+
+    fail::remove(finish_hb_fp);
+    fail::remove(apply_before_split_1_3_fp);
+    must_get_equal(&cluster.get_engine(3), b"k1", b"v1");
+    must_get_equal(&cluster.get_engine(3), b"k3", b"v3");
 }

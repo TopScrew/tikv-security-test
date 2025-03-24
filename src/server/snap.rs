@@ -5,7 +5,7 @@ use std::{
     io::{Error as IoError, ErrorKind, Read, Write},
     pin::Pin,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant as StdInstant},
@@ -110,6 +110,7 @@ struct SnapChunk {
     first: Option<SnapshotChunk>,
     snap: Box<Snapshot>,
     remain_bytes: usize,
+    io_type: IoType,
 }
 
 pub const SNAP_CHUNK_LEN: usize = 1024 * 1024;
@@ -128,6 +129,7 @@ impl Stream for SnapChunk {
             n if n > SNAP_CHUNK_LEN => vec![0; SNAP_CHUNK_LEN],
             n => vec![0; n],
         };
+        let _with_io_type = WithIoType::new(self.io_type);
         let result = self.snap.read_exact(buf.as_mut_slice());
         match result {
             Ok(_) => {
@@ -164,7 +166,7 @@ pub fn send_snap(
 
     let send_timer = SEND_SNAP_HISTOGRAM.start_coarse_timer();
 
-    let (key, snap_start, generate_duration_sec) = {
+    let (key, snap_start, generate_duration_sec, io_type) = {
         let snap = msg.get_message().get_snapshot();
         let mut snap_data = RaftSnapshotData::default();
         if let Err(e) = snap_data.merge_from_bytes(snap.get_data()) {
@@ -173,7 +175,12 @@ pub fn send_snap(
         let key = SnapKey::from_region_snap(msg.get_region_id(), snap);
         let snap_start = snap_data.get_meta().get_start();
         let generate_duration_sec = snap_data.get_meta().get_generate_duration_sec();
-        (key, snap_start, generate_duration_sec)
+        let io_type = if snap_data.get_meta().get_for_balance() {
+            IoType::LoadBalance
+        } else {
+            IoType::Replication
+        };
+        (key, snap_start, generate_duration_sec, io_type)
     };
 
     mgr.register(key.clone(), SnapEntry::Sending);
@@ -198,6 +205,7 @@ pub fn send_snap(
             first: Some(first_chunk),
             snap: s,
             remain_bytes: total_size as usize,
+            io_type,
         }
     };
 
@@ -219,6 +227,9 @@ pub fn send_snap(
 
             #[cfg(feature = "failpoints")]
             {
+                fail::fail_point!("snap_send_error", |_| {
+                    Err(Error::Other(box_err!("snap_send_error")))
+                });
                 let should_delay = (|| {
                     fail::fail_point!("snap_send_timer_delay", |_| { true });
                     false
@@ -247,10 +258,11 @@ pub fn send_snap(
         send_timer.observe_duration();
         drop(deregister);
         drop(client);
+
+        fail_point!("snapshot_delete_after_send");
+        mgr.delete_snapshot(&key, &chunks.snap, true);
         match recv_result {
             Ok(_) => {
-                fail_point!("snapshot_delete_after_send");
-                mgr.delete_snapshot(&key, &chunks.snap, true);
                 let cost = UnixSecs::now().into_inner().saturating_sub(snap_start);
                 let send_duration_sec = timer.saturating_elapsed().as_secs();
                 // it should ignore if the duration of snapshot is less than 1s to decrease the
@@ -357,11 +369,18 @@ fn recv_snap<R: RaftExtension + 'static>(
     sink: ClientStreamingSink<Done>,
     snap_mgr: SnapManager,
     raft_router: R,
+    recving_count: Arc<AtomicUsize>,
 ) -> impl Future<Output = Result<()>> {
+    let region_id = Arc::new(AtomicU64::new(0));
+    let region_id_clone = region_id.clone();
+    let snap_mgr_clone = snap_mgr.clone();
     let recv_task = async move {
         let mut stream = stream.map_err(Error::from);
         let head = stream.next().await.transpose()?;
         let mut context = RecvSnapContext::new(head, &snap_mgr)?;
+        let _guard = set_panic_context! {"snap_key" => context.key.to_string()};
+        // Record the region_id for later cleanup.
+        region_id.store(context.raft_msg.region_id, Ordering::SeqCst);
         if context.file.is_none() {
             return context.finish(raft_router);
         }
@@ -373,6 +392,7 @@ fn recv_snap<R: RaftExtension + 'static>(
         snap_mgr.register(context.key.clone(), SnapEntry::Receiving);
         defer!(snap_mgr.deregister(&context_key, &SnapEntry::Receiving));
         while let Some(item) = stream.next().await {
+            fail_point!("receiving_snapshot_callback");
             fail_point!("receiving_snapshot_net_error", |_| {
                 Err(box_err!("{} failed to receive snapshot", context_key))
             });
@@ -393,6 +413,11 @@ fn recv_snap<R: RaftExtension + 'static>(
         context.finish(raft_router)
     };
     async move {
+        defer!(cleanup_after_recv(
+            region_id_clone,
+            snap_mgr_clone,
+            recving_count
+        ));
         match recv_task.await {
             Ok(()) => sink.success(Done::default()).await.map_err(Error::from),
             Err(e) => {
@@ -400,6 +425,25 @@ fn recv_snap<R: RaftExtension + 'static>(
                 sink.fail(status).await.map_err(Error::from)
             }
         }
+    }
+}
+
+// Cleans up resources after snapshot reception. Ensures that the occupied
+// resource within the concurrency limiter (used in snapshot precheck) is
+// released.
+fn cleanup_after_recv(
+    region_id: Arc<AtomicU64>,
+    snap_mgr: SnapManager,
+    recving_count: Arc<AtomicUsize>,
+) {
+    recving_count.fetch_sub(1, Ordering::SeqCst);
+    let id = region_id.load(Ordering::SeqCst);
+    if id != 0 {
+        // Notify the snapshot manager that a snapshot has been received,
+        // freeing up the associated resource in the concurrency limiter. Note
+        // that this should happen after decrementing `recving_count` (see
+        // #17903).
+        snap_mgr.recv_snap_complete(id);
     }
 }
 
@@ -461,9 +505,17 @@ impl<R: RaftExtension + 'static> Runner<R> {
             };
             self.snap_mgr.set_speed_limit(limit);
             self.snap_mgr.set_max_total_snap_size(max_total_size);
-            info!("refresh snapshot manager config";
-            "speed_limit"=> limit,
-            "max_total_snap_size"=> max_total_size);
+            self.snap_mgr
+                .set_min_ingest_cf_limit(incoming.snap_min_ingest_size);
+            info!(
+                "refresh snapshot manager config";
+                "speed_limit" => limit,
+                "max_total_snap_size" => max_total_size,
+                "min_ingest_cf_size" => ?incoming.snap_min_ingest_size);
+            if incoming.concurrent_recv_snap_limit > 0 {
+                self.snap_mgr
+                    .set_concurrent_recv_snap_limit(incoming.concurrent_recv_snap_limit);
+            }
             self.cfg = incoming.clone();
         }
     }
@@ -492,6 +544,7 @@ impl<R: RaftExtension + 'static> Runnable for Runner<R> {
         match task {
             Task::Recv { stream, sink } => {
                 if let Some(status) = self.receiving_busy() {
+                    SNAP_TASK_COUNTER_STATIC.recv_dropped.inc();
                     self.pool.spawn(sink.fail(status));
                     return;
                 }
@@ -503,8 +556,8 @@ impl<R: RaftExtension + 'static> Runnable for Runner<R> {
                 let recving_count = Arc::clone(&self.recving_count);
                 recving_count.fetch_add(1, Ordering::SeqCst);
                 let task = async move {
-                    let result = recv_snap(stream, sink, snap_mgr, raft_router).await;
-                    recving_count.fetch_sub(1, Ordering::SeqCst);
+                    let result =
+                        recv_snap(stream, sink, snap_mgr, raft_router, recving_count).await;
                     if let Err(e) = result {
                         error!("failed to recv snapshot"; "err" => %e);
                     }
@@ -559,6 +612,7 @@ impl<R: RaftExtension + 'static> Runnable for Runner<R> {
                 let region_id = msg.get_region_id();
                 if self.sending_count.load(Ordering::SeqCst) >= self.cfg.concurrent_send_snap_limit
                 {
+                    SNAP_TASK_COUNTER_STATIC.send_dropped.inc();
                     warn!(
                         "too many sending snapshot tasks, drop Send Snap[to: {}, snap: {:?}]",
                         addr, msg

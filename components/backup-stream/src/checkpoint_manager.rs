@@ -15,6 +15,7 @@ use kvproto::{
 };
 use pd_client::PdClient;
 use tikv_util::{box_err, defer, info, warn, worker::Scheduler};
+use tracing::instrument;
 use txn_types::TimeStamp;
 use uuid::Uuid;
 
@@ -52,7 +53,6 @@ impl std::fmt::Debug for CheckpointManager {
 enum SubscriptionOp {
     Add(Subscription),
     Emit(Box<[FlushEvent]>),
-    #[cfg(test)]
     Inspect(Box<dyn FnOnce(&SubscriptionManager) + Send>),
 }
 
@@ -75,7 +75,6 @@ impl SubscriptionManager {
                 SubscriptionOp::Emit(events) => {
                     self.emit_events(events).await;
                 }
-                #[cfg(test)]
                 SubscriptionOp::Inspect(f) => {
                     f(&self);
                 }
@@ -84,6 +83,7 @@ impl SubscriptionManager {
         // NOTE: Maybe close all subscription streams here.
     }
 
+    #[instrument(skip_all, fields(length = events.len()))]
     async fn emit_events(&mut self, events: Box<[FlushEvent]>) {
         let mut canceled = vec![];
         info!("log backup sending events"; "event_len" => %events.len(), "downstream" => %self.subscribers.len());
@@ -108,6 +108,7 @@ impl SubscriptionManager {
         }
     }
 
+    #[instrument(skip(self))]
     async fn remove_subscription(&mut self, id: &Uuid) {
         match self.subscribers.remove(id) {
             Some(sub) => {
@@ -389,8 +390,7 @@ impl CheckpointManager {
         self.resolved_ts.values().map(|x| x.checkpoint).min()
     }
 
-    #[cfg(test)]
-    fn sync_with_subs_mgr<T: Send + 'static>(
+    pub fn sync_with_subs_mgr<T: Send + 'static>(
         &mut self,
         f: impl FnOnce(&SubscriptionManager) -> T + Send + 'static,
     ) -> T {
@@ -661,6 +661,7 @@ pub mod tests {
             Self(Arc::new(Mutex::new(inner)))
         }
 
+        #[allow(clippy::unused_async)]
         pub async fn fail(&self, status: RpcStatus) -> crate::errors::Result<()> {
             panic!("failed in a case should never fail: {}", status);
         }
@@ -892,8 +893,8 @@ pub mod tests {
         let r = flush_observer.after(&task, rts).await;
         assert_eq!(r.is_ok(), true);
 
-        let serivce_id = format!("backup-stream-{}-{}", task, store_id);
-        let r = pd_cli.get_service_safe_point(serivce_id).unwrap();
+        let service_id = format!("backup-stream-{}-{}", task, store_id);
+        let r = pd_cli.get_service_safe_point(service_id).unwrap();
         assert_eq!(r.into_inner(), rts - 1);
     }
 }
