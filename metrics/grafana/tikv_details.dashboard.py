@@ -1368,7 +1368,7 @@ def ThreadCPU() -> RowPanel:
                     target(
                         expr=expr_sum_rate(
                             "tikv_thread_cpu_seconds_total",
-                            label_selectors=['name=~"(sst_|impwkr_).*"'],
+                            label_selectors=['name=~"sst_.*"'],
                         ),
                     ),
                 ],
@@ -1892,13 +1892,13 @@ def RaftWaterfall() -> RowPanel:
         [
             graph_panel_histogram_quantiles(
                 title="Store propose wait duration",
-                description="Time from request scheduling to when it is handled by Raftstore",
+                description="The propose wait time duration of each request",
                 yaxes=yaxes(left_format=UNITS.SECONDS),
                 metric="tikv_raftstore_request_wait_time_duration_secs",
             ),
             graph_panel_histogram_quantiles(
                 title="Store batch wait duration",
-                description="Time from request scheduling to when a batch of requests is formed and prepared to be proposed to Raft",
+                description="The batch wait time duration of each request",
                 yaxes=yaxes(left_format=UNITS.SECONDS),
                 metric="tikv_raftstore_store_wf_batch_wait_duration_seconds",
             ),
@@ -1908,13 +1908,13 @@ def RaftWaterfall() -> RowPanel:
         [
             graph_panel_histogram_quantiles(
                 title="Store send to write queue duration",
-                description="Time from request scheduling to just before it is sent to the store writer thread",
+                description="The send-to-write-queue time duration of each request",
                 yaxes=yaxes(left_format=UNITS.SECONDS),
                 metric="tikv_raftstore_store_wf_send_to_queue_duration_seconds",
             ),
             graph_panel_histogram_quantiles(
                 title="Store send proposal duration",
-                description="Time from request scheduling to just before it is sent to followers",
+                description="The send raft message of the proposal duration of each request",
                 yaxes=yaxes(left_format=UNITS.SECONDS),
                 metric="tikv_raftstore_store_wf_send_proposal_duration_seconds",
             ),
@@ -1924,13 +1924,13 @@ def RaftWaterfall() -> RowPanel:
         [
             graph_panel_histogram_quantiles(
                 title="Store write kv db end duration",
-                description="Time from request scheduling to when the batch's snapshot state is written to KV DB",
+                description="The write kv db end duration of each request",
                 yaxes=yaxes(left_format=UNITS.SECONDS),
                 metric="tikv_raftstore_store_wf_write_kvdb_end_duration_seconds",
             ),
             graph_panel_histogram_quantiles(
                 title="Store before write duration",
-                description="Time from request scheduling to just before it is written to Raft Engine",
+                description="The before write time duration of each request",
                 yaxes=yaxes(left_format=UNITS.SECONDS),
                 metric="tikv_raftstore_store_wf_before_write_duration_seconds",
             ),
@@ -1939,16 +1939,16 @@ def RaftWaterfall() -> RowPanel:
     layout.row(
         [
             graph_panel_histogram_quantiles(
-                title="Store write end duration",
-                description="Time from request scheduling to when it is written to Raft Engine",
-                yaxes=yaxes(left_format=UNITS.SECONDS),
-                metric="tikv_raftstore_store_wf_write_end_duration_seconds",
-            ),
-            graph_panel_histogram_quantiles(
                 title="Store persist duration",
-                description="Time from request scheduling to when its associated ready is persisted on the leader",
+                description="The persist duration of each request",
                 yaxes=yaxes(left_format=UNITS.SECONDS),
                 metric="tikv_raftstore_store_wf_persist_duration_seconds",
+            ),
+            graph_panel_histogram_quantiles(
+                title="Store write end duration",
+                description="The write end duration of each request",
+                yaxes=yaxes(left_format=UNITS.SECONDS),
+                metric="tikv_raftstore_store_wf_write_end_duration_seconds",
             ),
         ]
     )
@@ -1956,13 +1956,13 @@ def RaftWaterfall() -> RowPanel:
         [
             graph_panel_histogram_quantiles(
                 title="Store commit but not persist duration",
-                description="Time from request scheduling to when it is committed; at the time of commit, it has not been persisted on the leader",
+                description="The commit but not persist duration of each request",
                 yaxes=yaxes(left_format=UNITS.SECONDS),
                 metric="tikv_raftstore_store_wf_commit_not_persist_log_duration_seconds",
             ),
             graph_panel_histogram_quantiles(
                 title="Store commit and persist duration",
-                description="Time from request scheduling to when it is committed; at the time of commit, it has been persisted on the leader",
+                description="The commit and persist duration of each request",
                 yaxes=yaxes(left_format=UNITS.SECONDS),
                 metric="tikv_raftstore_store_wf_commit_log_duration_seconds",
             ),
@@ -1971,88 +1971,14 @@ def RaftWaterfall() -> RowPanel:
     return layout.row_panel
 
 
-def RaftstoreIO() -> RowPanel:
-    layout = Layout(title="Raftstore IO")
-
-    def add_row(layout, label: str, desc: str):
-        title = label.replace("_", " ").capitalize()
-        layout.row(
-            heatmap_panel_graph_panel_histogram_quantile_pairs(
-                heatmap_title=f"{title}",
-                heatmap_description=f"{desc}",
-                graph_title=f"99% {title}",
-                graph_description=f"{desc}",
-                graph_by_labels=["instance"],
-                graph_hides=["count", "avg"],
-                yaxis_format=UNITS.SECONDS,
-                metric="tikv_raftstore_io_duration_seconds",
-                label_selectors=[f'reason="{label}"'],
-            )
-        )
-
-    for lb, desc in [
-        (
-            "peer_destroy_kv_write",
-            "The time taken by Raftstore to complete RocksDB write operation when destroying a peer",
-        ),
-        (
-            "peer_destroy_raft_write",
-            "The time taken by Raftstore to complete RaftEngine write operation when destroying a peer",
-        ),
-        (
-            "init_raft_state",
-            "The time taken by Raftstore to complete initializing raft state when creating a peer",
-        ),
-        (
-            "init_apply_state",
-            "The time taken by Raftstore to complete initializing apply state when creating a peer",
-        ),
-        (
-            "entry_storage_create",
-            "The time taken by Raftstore to complete RaftEngine read operation when creating a peer",
-        ),
-        (
-            "store_check_msg",
-            "The time taken by Raftstore to check region state when TiKV receives an message to non-exist regions",
-        ),
-        (
-            "peer_check_merge_target_stale",
-            "The time taken by Raftstore to check stale merged regions",
-        ),
-        (
-            "peer_maybe_create",
-            "The time taken by Raftstore to complete RocksDB and RaftEngine read operation when creating a peer",
-        ),
-        (
-            "peer_snapshot_read",
-            "The time taken by Raftstore to complete a read requests",
-        ),
-        (
-            "v2_compatible_learner",
-            "The time taken by Raftstore to handle raftstore v2 compatibility checking",
-        ),
-        (
-            "raft_term",
-            "The time taken by Raftstore to get terms of raft logs by reading RaftEngine",
-        ),
-        (
-            "raft_fetch_log",
-            "The time taken by Raftstore to fetch raft logs by reading RaftEngine",
-        ),
-    ]:
-        add_row(layout, lb, desc)
-
-    return layout.row_panel
-
-
 def RaftIO() -> RowPanel:
     layout = Layout(title="Raft IO")
     layout.row(
         heatmap_panel_graph_panel_histogram_quantile_pairs(
             heatmap_title="Process ready duration",
-            heatmap_description="The time taken by Raftstore to complete processing a poll round, which includes a batch of region peers",
+            heatmap_description="The time consumed for peer processes to be ready in Raft",
             graph_title="99% Process ready duration per server",
-            graph_description="The time taken by Raftstore to complete processing a poll round, which includes a batch of region peers",
+            graph_description="The time consumed for peer processes to be ready in Raft",
             graph_by_labels=["instance"],
             graph_hides=["count", "avg"],
             yaxis_format=UNITS.SECONDS,
@@ -2620,30 +2546,6 @@ def RaftMessage() -> RowPanel:
                 ],
             ),
         ]
-    )
-    layout.row(
-        heatmap_panel_graph_panel_histogram_quantile_pairs(
-            heatmap_title="Raft Message Send Wait duration",
-            heatmap_description="The time consumed waiting to send Raft Messages",
-            graph_title="99% Raft Message Send Wait Duration",
-            graph_description="The time consumed waiting to send Raft Messages per TiKV instance",
-            graph_by_labels=["instance"],
-            yaxis_format=UNITS.SECONDS,
-            metric="tikv_server_raft_message_duration_seconds",
-            label_selectors=['type="send_wait"'],
-        )
-    )
-    layout.row(
-        heatmap_panel_graph_panel_histogram_quantile_pairs(
-            heatmap_title="Raft Message Receive Delay duration",
-            heatmap_description="The time consumed to transmit Raft Messages over the network, reported by the receiver",
-            graph_title="99% Raft Message Receive Delay Duration",
-            graph_description="The time consumed to transmit Raft Messages over the network per TiKV instance, reported by the receiver",
-            graph_by_labels=["instance"],
-            yaxis_format=UNITS.SECONDS,
-            metric="tikv_server_raft_message_duration_seconds",
-            label_selectors=['type="receive_delay"'],
-        )
     )
     return layout.row_panel
 
@@ -4207,14 +4109,12 @@ def Snapshot() -> RowPanel:
                     target(
                         expr=expr_sum_rate(
                             "tikv_snapshot_limit_transport_bytes",
-                            label_selectors=['type!~"send"'],
                             by_labels=["instance", "type"],
                         )
                     ),
                     target(
                         expr=expr_sum_rate(
                             "tikv_snapshot_limit_generate_bytes",
-                            label_selectors=['type=~"io"'],
                             by_labels=["instance", "type"],
                         ),
                         legend_format="{{instance}}-generate-{{type}}",
@@ -5598,8 +5498,8 @@ def RocksDB() -> RowPanel:
         [
             graph_panel(
                 title="Compaction operations",
-                description="The rate of completed compaction and flush operations (left axis) and the count of running operations (right axis).",
-                yaxes=yaxes(left_format=UNITS.OPS_PER_SEC, right_format=UNITS.SHORT),
+                description="The count of compaction and flush operations",
+                yaxes=yaxes(left_format=UNITS.OPS_PER_SEC),
                 targets=[
                     target(
                         expr=expr_sum_rate(
@@ -5610,34 +5510,6 @@ def RocksDB() -> RowPanel:
                             by_labels=["type"],
                         ),
                         additional_groupby=True,
-                    ),
-                    target(
-                        expr=expr_sum(
-                            "tikv_engine_num_running_compactions",
-                            label_selectors=[
-                                'db="$db"',
-                            ],
-                            by_labels=[],  # override default by instance.
-                        ),
-                        legend_format="running-compactions",
-                        additional_groupby=True,
-                    ),
-                    target(
-                        expr=expr_sum(
-                            "tikv_engine_num_running_flushes",
-                            label_selectors=[
-                                'db="$db"',
-                            ],
-                            by_labels=[],  # override default by instance.
-                        ),
-                        legend_format="running-flushes",
-                        additional_groupby=True,
-                    ),
-                ],
-                series_overrides=[
-                    series_override(
-                        alias="/running-.*/",
-                        yaxis=2,
                     ),
                 ],
             ),
@@ -6761,24 +6633,6 @@ def RocksDB() -> RowPanel:
                 metric="tikv_storage_ingest_external_file_duration_secs",
                 by_labels=["cf", "type"],
                 hide_count=True,
-            ),
-        ]
-    )
-    layout.row(
-        [
-            graph_panel(
-                title="Ingest SST allow_write",
-                description=None,
-                yaxes=yaxes(left_format=UNITS.SHORT),
-                targets=[
-                    target(
-                        expr=expr_sum_rate(
-                            "tikv_storage_ingest_external_file_allow_write_counter",
-                            by_labels=["type"],
-                        ),
-                        additional_groupby=True,
-                    ),
-                ],
             ),
         ]
     )
@@ -10223,7 +10077,6 @@ dashboard = Dashboard(
         IOBreakdown(),
         # Raftstore
         RaftWaterfall(),
-        RaftstoreIO(),
         RaftIO(),
         RaftPropose(),
         RaftProcess(),

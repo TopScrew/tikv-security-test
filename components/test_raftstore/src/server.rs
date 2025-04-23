@@ -67,7 +67,7 @@ use tikv::{
         lock_manager::LockManager,
         raftkv::ReplicaReadLockChecker,
         resolve::{self, StoreAddrResolver},
-        service::{DebugService, DefaultGrpcMessageFilter},
+        service::DebugService,
         tablet_snap::NoSnapshotCache,
         ConnectionBuilder, Error, MultiRaftServer, PdStoreAddrResolver, RaftClient, RaftKv,
         Result as ServerResult, Server, ServerTransport,
@@ -394,7 +394,7 @@ impl ServerCluster {
 
         let latest_ts =
             block_on(self.pd_client.get_tso()).expect("failed to get timestamp from PD");
-        let concurrency_manager = ConcurrencyManager::new_for_test(latest_ts);
+        let concurrency_manager = ConcurrencyManager::new(latest_ts);
 
         let (tx, rx) = std::sync::mpsc::channel();
         let mut gc_worker = GcWorker::new(
@@ -617,9 +617,6 @@ impl ServerCluster {
                 debug_thread_pool.clone(),
                 health_controller.clone(),
                 resource_manager.clone(),
-                Arc::new(DefaultGrpcMessageFilter::new(
-                    server_cfg.value().reject_messages_on_memory_ratio,
-                )),
             )
             .unwrap();
             svr.register_service(create_import_sst(import_service.clone()));
@@ -993,7 +990,7 @@ pub fn must_new_and_configure_cluster(
     must_new_and_configure_cluster_mul(1, configure)
 }
 
-pub fn must_new_and_configure_cluster_mul(
+fn must_new_and_configure_cluster_mul(
     count: usize,
     mut configure: impl FnMut(&mut Cluster<ServerCluster>),
 ) -> (Cluster<ServerCluster>, metapb::Peer, Context) {

@@ -104,7 +104,6 @@ impl online_config::ConfigManager for ConfigManager {
 
 impl std::ops::Deref for ConfigManager {
     type Target = RwLock<Config>;
-
     fn deref(&self) -> &Self::Target {
         self.config.as_ref()
     }

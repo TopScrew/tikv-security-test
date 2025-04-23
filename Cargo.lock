@@ -193,8 +193,8 @@ dependencies = [
  "memchr",
  "pin-project-lite",
  "tokio",
- "zstd 0.13.2",
- "zstd-safe 7.2.1",
+ "zstd",
+ "zstd-safe",
 ]
 
 [[package]]
@@ -1265,12 +1265,13 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.0.83"
+version = "1.2.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1174fb0b6ec23863f8b971027804a42614e347eafb0a95bf0b12cdae21fc4d0"
+checksum = "525046617d8376e3db1deffb079e91cef90a89fc3ca5c185bbf8c9ecdd15cd5c"
 dependencies = [
  "jobserver",
  "libc 0.2.151",
+ "shlex",
 ]
 
 [[package]]
@@ -1468,8 +1469,8 @@ dependencies = [
 
 [[package]]
 name = "cmake"
-version = "0.1.48"
-source = "git+https://github.com/rust-lang/cmake-rs#00e6b220342a8b0ec4548071928ade38fd5f691b"
+version = "0.1.54"
+source = "git+https://github.com/rust-lang/cmake-rs#fd56c5a6b4ecda8815c863eb5b12d7b3f0391197"
 dependencies = [
  "cc",
 ]
@@ -1508,53 +1509,6 @@ version = "0.1.0"
 dependencies = [
  "fxhash",
  "tikv_alloc",
-]
-
-[[package]]
-name = "compact-log-backup"
-version = "0.1.0"
-dependencies = [
- "async-compression",
- "bytes",
- "chrono",
- "codec",
- "crc64fast",
- "dashmap",
- "derive_more",
- "encryption",
- "engine_rocks",
- "engine_traits",
- "external_storage",
- "fail",
- "file_system",
- "futures 0.3.15",
- "futures-io",
- "hex 0.4.3",
- "keys",
- "kvproto",
- "lazy_static",
- "pin-project",
- "pprof",
- "prometheus",
- "protobuf",
- "serde",
- "serde_json",
- "slog",
- "slog-global",
- "tempdir",
- "test_util",
- "thiserror",
- "tidb_query_datatype",
- "tikv_alloc",
- "tikv_util",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tracing",
- "tracing-active-tree",
- "txn_types",
- "uuid 0.8.2",
- "zstd 0.11.2+zstd.1.5.2",
 ]
 
 [[package]]
@@ -1795,9 +1749,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-channel"
-version = "0.5.13"
+version = "0.5.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33480d6946193aa8033910124896ca395333cae7e2d1113d1fef6c3272217df2"
+checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -2144,7 +2098,6 @@ dependencies = [
  "engine_traits",
  "kvproto",
  "raft",
- "tikv_util",
  "tracker",
  "txn_types",
 ]
@@ -2232,7 +2185,6 @@ dependencies = [
  "log_wrappers",
  "protobuf",
  "raft",
- "rand 0.8.5",
  "serde",
  "slog",
  "slog-global",
@@ -2241,18 +2193,6 @@ dependencies = [
  "toml",
  "tracker",
  "txn_types",
-]
-
-[[package]]
-name = "engine_traits_tests"
-version = "0.0.1"
-dependencies = [
- "encryption_export",
- "engine_test",
- "engine_traits",
- "panic_hook",
- "tempfile",
- "test_util",
 ]
 
 [[package]]
@@ -2406,7 +2346,6 @@ dependencies = [
  "chrono",
  "cloud",
  "encryption",
- "fail",
  "file_system",
  "futures 0.3.15",
  "futures-io",
@@ -3280,7 +3219,7 @@ dependencies = [
  "httpdate",
  "itoa 1.0.1",
  "pin-project-lite",
- "socket2",
+ "socket2 0.4.7",
  "tokio",
  "tower-service",
  "tracing",
@@ -3696,13 +3635,11 @@ checksum = "1aab8fc367588b89dcee83ab0fd66b72b50b72fa1904d7095045ace2b0c81c35"
 
 [[package]]
 name = "jobserver"
-version = "0.1.17"
+version = "0.1.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2b1d42ef453b30b7387e113da1c83ab1605d90c5b4e0eb8e96d016ed3b8c160"
+checksum = "48d1dbcbbeb6a7fec7e059840aa538bd62aaccf972c7346c4d9d2059312853d0"
 dependencies = [
- "getrandom 0.1.12",
  "libc 0.2.151",
- "log",
 ]
 
 [[package]]
@@ -3749,7 +3686,7 @@ dependencies = [
 [[package]]
 name = "kvproto"
 version = "0.0.2"
-source = "git+https://github.com/pingcap/kvproto.git#258e68e813aa1af3a9817ce87630e2ec638851cd"
+source = "git+https://github.com/pingcap/kvproto.git#b6a98c6bf02d1864e74029f31ff99951719d96c1"
 dependencies = [
  "futures 0.3.15",
  "grpcio",
@@ -3853,9 +3790,9 @@ dependencies = [
 
 [[package]]
 name = "libz-sys"
-version = "1.1.3"
+version = "1.1.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de5435b8549c16d423ed0c03dbaafe57cf6c3344744f1242520d59c9d8ecec66"
+checksum = "8b70e7a7df205e92a1a4cd9aaae7898dac0aa555503cc0a649494d0d60e7651d"
 dependencies = [
  "cc",
  "libc 0.2.151",
@@ -4098,14 +4035,13 @@ dependencies = [
 
 [[package]]
 name = "mio"
-version = "1.0.2"
+version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80e04d1dcff3aae0704555fe5fee3bcfaf3d1fdf8a7e521d5b9d2b42acb52cec"
+checksum = "a4a650543ca06a924e8b371db273b2756685faae30f8487da1b56505a8f78b0c"
 dependencies = [
- "hermit-abi 0.3.9",
  "libc 0.2.151",
  "wasi 0.11.0+wasi-snapshot-preview1",
- "windows-sys 0.52.0",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -6444,6 +6380,16 @@ dependencies = [
 
 [[package]]
 name = "socket2"
+version = "0.4.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02e2d2db9033d13a1567121ddd7a095ee144db4e1ca1b1bda3419bc0da294ebd"
+dependencies = [
+ "libc 0.2.151",
+ "winapi 0.3.9",
+]
+
+[[package]]
+name = "socket2"
 version = "0.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce305eb0b4296696835b71df73eb912e0f1ffd2556a501fcede6e0c50349191c"
@@ -7285,7 +7231,6 @@ dependencies = [
  "bstr",
  "byteorder",
  "chrono",
- "chrono-tz",
  "codec",
  "crypto",
  "file_system",
@@ -7317,7 +7262,7 @@ dependencies = [
 
 [[package]]
 name = "tikv"
-version = "9.0.0-beta.1"
+version = "8.5.2"
 dependencies = [
  "anyhow",
  "api_version",
@@ -7446,11 +7391,9 @@ name = "tikv-ctl"
 version = "0.0.1"
 dependencies = [
  "api_version",
- "base64 0.13.0",
  "cc",
  "clap 2.33.0",
  "collections",
- "compact-log-backup",
  "crypto",
  "encryption_export",
  "engine_rocks",
@@ -7478,7 +7421,6 @@ dependencies = [
  "slog",
  "slog-global",
  "structopt",
- "tempfile",
  "tikv",
  "tikv_util",
  "time 0.1.43",
@@ -7747,20 +7689,21 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.41.1"
+version = "1.38.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22cfb5bee7a6a52939ca9224d6ac897bb669134078daa8735560897f69de4d33"
+checksum = "68722da18b0fc4a05fdc1120b302b82051265792a1e1b399086e9b204b10ad3d"
 dependencies = [
  "backtrace",
  "bytes",
  "libc 0.2.151",
- "mio 1.0.2",
+ "mio 0.8.11",
+ "num_cpus",
  "parking_lot 0.12.1",
  "pin-project-lite",
  "signal-hook-registry",
- "socket2",
+ "socket2 0.5.7",
  "tokio-macros",
- "windows-sys 0.52.0",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -7774,9 +7717,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-macros"
-version = "2.4.0"
+version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "693d596312e88961bc67d7f1f97af8a70227d9f90c31bba5806eec004978d752"
+checksum = "5f5ae998a069d4b5aba8ee9dad856af7d520c3699e6159b185c2acd48155d39a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7988,7 +7931,7 @@ version = "1.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "97fee6b57c6a41524a810daee9286c02d7752c4253064d0b05472833a438f675"
 dependencies = [
- "cfg-if 1.0.0",
+ "cfg-if 0.1.10",
  "static_assertions",
 ]
 
@@ -8001,7 +7944,6 @@ dependencies = [
  "codec",
  "collections",
  "error_code",
- "fail",
  "farmhash",
  "kvproto",
  "log_wrappers",
@@ -8764,30 +8706,11 @@ dependencies = [
 
 [[package]]
 name = "zstd"
-version = "0.11.2+zstd.1.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20cc960326ece64f010d2d2107537f26dc589a6573a316bd5b1dba685fa5fde4"
-dependencies = [
- "zstd-safe 5.0.2+zstd.1.5.2",
-]
-
-[[package]]
-name = "zstd"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fcf2b778a664581e31e389454a7072dab1647606d44f7feea22cd5abb9c9f3f9"
 dependencies = [
- "zstd-safe 7.2.1",
-]
-
-[[package]]
-name = "zstd-safe"
-version = "5.0.2+zstd.1.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d2a5585e04f9eea4b2a3d1eca508c4dee9592a89ef6f450c11719da0726f4db"
-dependencies = [
- "libc 0.2.151",
- "zstd-sys",
+ "zstd-safe",
 ]
 
 [[package]]

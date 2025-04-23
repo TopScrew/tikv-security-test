@@ -32,10 +32,7 @@ use protobuf::Message;
 use raft::{self, eraftpb::Entry, RawNode};
 use raftstore::{
     coprocessor::get_region_approximate_middle,
-    store::{
-        local_metrics::RaftMetrics, write_initial_apply_state, write_initial_raft_state,
-        write_peer_state, PeerStorage,
-    },
+    store::{write_initial_apply_state, write_initial_raft_state, write_peer_state, PeerStorage},
 };
 use thiserror::Error;
 use tikv_kv::Engine;
@@ -488,7 +485,6 @@ where
                 fake_raftlog_fetch_worker.scheduler(),
                 peer_id,
                 tag,
-                &RaftMetrics::new(false),
             ));
 
             let raft_cfg = raft::Config {

@@ -246,8 +246,7 @@ mod tests {
     use tempfile::Builder;
     use test_sst_importer::{new_test_engine, new_test_engine_with_options};
     use tikv_util::{config::ReadableDuration, resizable_threadpool::ResizableRuntime};
-    use tokio::runtime::Runtime;
-    type TokioResult<T> = std::io::Result<T>;
+    use tokio::{io::Result as TokioResult, runtime::Runtime};
 
     use super::*;
 
@@ -358,13 +357,13 @@ mod tests {
         let switcher = ImportModeSwitcher::new(&cfg);
         let handle = threads.handle();
 
-        switcher.start_resizable_threads(&handle, db.clone());
+        switcher.start_resizable_threads(&handle.clone(), db.clone());
         check_import_options(&db, &normal_db_options, &normal_cf_options);
         switcher.enter_import_mode(&db, mf).unwrap();
         check_import_options(&db, &import_db_options, &import_cf_options);
 
         thread::sleep(Duration::from_secs(1));
-        handle.block_on(tokio::task::yield_now());
+        threads.block_on(tokio::task::yield_now());
 
         check_import_options(&db, &normal_db_options, &normal_cf_options);
     }

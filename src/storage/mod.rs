@@ -700,17 +700,6 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                                 r
                             })
                     });
-                    if let Err(
-                        e @ Error(box ErrorInner::Txn(TxnError(box TxnErrorInner::Mvcc(
-                            mvcc::Error(box mvcc::ErrorInner::DefaultNotFound { .. }),
-                        )))),
-                    ) = &result
-                    {
-                        error!("default not found in storage get";
-                            "err" => ?e,
-                            "RpcContext" => ?&ctx,
-                        );
-                    }
                     metrics::tls_collect_scan_details(CMD, &statistics);
                     metrics::tls_collect_read_flow(
                         ctx.get_region_id(),
@@ -1323,17 +1312,6 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                             });
                         (result, stats)
                     });
-                    if let Err(
-                        e @ Error(box ErrorInner::Txn(TxnError(box TxnErrorInner::Mvcc(
-                            mvcc::Error(box mvcc::ErrorInner::DefaultNotFound { .. }),
-                        )))),
-                    ) = &result
-                    {
-                        error!("default not found in storage batch_get";
-                            "err" => ?e,
-                            "RpcContext" => ?&ctx,
-                        );
-                    }
                     metrics::tls_collect_scan_details(CMD, &stats);
                     let now = Instant::now();
                     SCHED_PROCESSING_READ_HISTOGRAM_STATIC
@@ -3666,7 +3644,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> TestStorageBuilder<E, L, F> {
             &self.config,
             ReadPool::from(read_pool).handle(),
             self.lock_mgr,
-            ConcurrencyManager::new_for_test(1.into()),
+            ConcurrencyManager::new(1.into()),
             DynamicConfigs {
                 pipelined_pessimistic_lock: self.pipelined_pessimistic_lock,
                 in_memory_pessimistic_lock: self.in_memory_pessimistic_lock,
@@ -3702,7 +3680,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> TestStorageBuilder<E, L, F> {
             &self.config,
             ReadPool::from(read_pool).handle(),
             self.lock_mgr,
-            ConcurrencyManager::new_for_test(1.into()),
+            ConcurrencyManager::new(1.into()),
             DynamicConfigs {
                 pipelined_pessimistic_lock: self.pipelined_pessimistic_lock,
                 in_memory_pessimistic_lock: self.in_memory_pessimistic_lock,
@@ -3741,7 +3719,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> TestStorageBuilder<E, L, F> {
             &self.config,
             ReadPool::from(read_pool).handle(),
             self.lock_mgr,
-            ConcurrencyManager::new_for_test(1.into()),
+            ConcurrencyManager::new(1.into()),
             DynamicConfigs {
                 pipelined_pessimistic_lock: self.pipelined_pessimistic_lock,
                 in_memory_pessimistic_lock: self.in_memory_pessimistic_lock,

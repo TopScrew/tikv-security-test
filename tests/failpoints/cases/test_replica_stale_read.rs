@@ -30,7 +30,8 @@ fn prepare_for_stale_read_before_run(
     let leader_client = PeerClient::new(&cluster, 1, leader);
 
     // There should be no read index message while handling stale read request
-    fail::cfg("propose_readindex_from_follower", "panic").unwrap();
+    let on_step_read_index_msg = "on_step_read_index_msg";
+    fail::cfg(on_step_read_index_msg, "panic").unwrap();
 
     (cluster, pd_client, leader_client)
 }

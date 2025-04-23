@@ -197,11 +197,6 @@ where
     propose_checked: Option<bool>,
     request: Option<RaftCmdRequest>,
     callbacks: Vec<Callback<E::Snapshot>>,
-
-    // Ref: https://github.com/tikv/tikv/issues/16818.
-    // Check for duplicate key entries batching proposed commands.
-    // TODO: remove this field when the cause of issue 16818 is located.
-    lock_cf_keys: HashSet<Vec<u8>>,
 }
 
 impl<EK, ER> Drop for PeerFsm<EK, ER>
@@ -265,7 +260,6 @@ where
         engines: Engines<EK, ER>,
         region: &metapb::Region,
         wait_data: bool,
-        raft_metrics: &RaftMetrics,
     ) -> Result<SenderFsmPair<EK, ER>> {
         let meta_peer = match find_peer(region, store_id) {
             None => {
@@ -298,7 +292,6 @@ where
                     meta_peer,
                     wait_data,
                     None,
-                    raft_metrics,
                 )?,
                 tick_registry: [false; PeerTick::VARIANT_COUNT],
                 missing_ticks: 0,
@@ -330,7 +323,6 @@ where
         region_id: u64,
         peer: metapb::Peer,
         create_by_peer: metapb::Peer,
-        raft_metrics: &RaftMetrics,
     ) -> Result<SenderFsmPair<EK, ER>> {
         // We will remove tombstone key when apply snapshot
         info!(
@@ -360,7 +352,6 @@ where
                     peer,
                     false,
                     Some(create_by_peer),
-                    raft_metrics,
                 )?,
                 tick_registry: [false; PeerTick::VARIANT_COUNT],
                 missing_ticks: 0,
@@ -444,7 +435,6 @@ where
             propose_checked: None,
             request: None,
             callbacks: vec![],
-            lock_cf_keys: HashSet::default(),
         }
     }
 
@@ -485,21 +475,6 @@ where
             mut callback,
             ..
         } = cmd;
-        // Ref: https://github.com/tikv/tikv/issues/16818.
-        // Check for duplicate key entries batching proposed commands.
-        // TODO: remove this check when the cause of issue 16818 is located.
-        for req in request.get_requests() {
-            if req.has_put() && req.get_put().get_cf() == CF_LOCK {
-                let key = req.get_put().get_key();
-                if !self.lock_cf_keys.insert(key.to_vec()) {
-                    panic!(
-                        "found duplicate key in Lock CF PUT request between batched requests. \
-                            key: {:?}, existing batch request: {:?}, new request to add: {:?}",
-                        key, self.request, request
-                    );
-                }
-            }
-        }
         if let Some(batch_req) = self.request.as_mut() {
             let requests: Vec<_> = request.take_requests().into();
             for q in requests {
@@ -542,7 +517,6 @@ where
             self.batch_req_size = 0;
             self.has_proposed_cb = false;
             self.propose_checked = None;
-            self.lock_cf_keys = HashSet::default();
             if self.callbacks.len() == 1 {
                 let cb = self.callbacks.pop().unwrap();
                 return Some((req, cb));
@@ -713,22 +687,6 @@ where
                     if let Some(Err(e)) = cmd.extra_opts.deadline.map(|deadline| deadline.check()) {
                         cmd.callback.invoke_with_response(new_error(e.into()));
                         continue;
-                    }
-
-                    // Ref: https://github.com/tikv/tikv/issues/16818.
-                    // Check for duplicate key entries within the to be proposed raft cmd.
-                    // TODO: remove this check when the cause of issue 16818 is located.
-                    let mut keys_set = std::collections::HashSet::new();
-                    for req in cmd.request.get_requests() {
-                        if req.has_put() && req.get_put().get_cf() == CF_LOCK {
-                            let key = req.get_put().get_key();
-                            if !keys_set.insert(key.to_vec()) {
-                                panic!(
-                                    "found duplicate key in Lock CF PUT request, key: {:?}, cmd: {:?}",
-                                    key, cmd
-                                );
-                            }
-                        }
                     }
 
                     let req_size = cmd.request.compute_size();
@@ -3815,10 +3773,6 @@ where
                 None => {
                     self.propose_pending_batch_raft_command();
                     if self.propose_locks_before_transfer_leader(msg) {
-                        fail_point!(
-                            "finish_proposing_transfer_cmd_after_proposing_locks",
-                            |_| {}
-                        );
                         // If some pessimistic locks are just proposed, we propose another
                         // TransferLeader command instead of transferring leader immediately.
                         info!("propose transfer leader command";
@@ -4213,7 +4167,6 @@ where
             &mut self.ctx.raft_perf_context,
             merged_by_target,
             &self.ctx.pending_create_peers,
-            &self.ctx.raft_metrics,
         ) {
             // If not panic here, the peer will be recreated in the next restart,
             // then it will be gc again. But if some overlap region is created
@@ -4660,7 +4613,6 @@ where
                 self.ctx.engines.clone(),
                 &new_region,
                 false,
-                &self.ctx.raft_metrics,
             ) {
                 Ok((sender, new_peer)) => (sender, new_peer),
                 Err(e) => {
@@ -4770,11 +4722,6 @@ where
             .get_id();
 
         let state_key = keys::region_state_key(target_region_id);
-        let _timer = self
-            .ctx
-            .raft_metrics
-            .io_read_peer_check_merge_target_stale
-            .start_timer();
         if let Some(target_state) = self
             .ctx
             .engines
@@ -7726,39 +7673,5 @@ mod tests {
         let _ = q.take_put();
         let req_size = req.compute_size();
         assert!(!builder.can_batch(&cfg, &req, req_size));
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_batch_build_with_duplicate_lock_cf_keys() {
-        let mut builder = BatchRaftCmdRequestBuilder::<KvTestEngine>::new();
-
-        // Create first request.
-        let mut req1 = RaftCmdRequest::default();
-        let mut put1 = Request::default();
-        let mut put_req1 = PutRequest::default();
-        put_req1.set_cf(CF_LOCK.to_string());
-        put_req1.set_key(b"key1".to_vec());
-        put_req1.set_value(b"value1".to_vec());
-        put1.set_cmd_type(CmdType::Put);
-        put1.set_put(put_req1);
-        req1.mut_requests().push(put1);
-
-        // Create second request with same key in Lock CF.
-        let mut req2 = RaftCmdRequest::default();
-        let mut put2 = Request::default();
-        let mut put_req2 = PutRequest::default();
-        put_req2.set_cf(CF_LOCK.to_string());
-        put_req2.set_key(b"key1".to_vec());
-        put_req2.set_value(b"value2".to_vec());
-        put2.set_cmd_type(CmdType::Put);
-        put2.set_put(put_req2);
-        req2.mut_requests().push(put2);
-
-        // Add both requests to batch builder, should cause panic.
-        let size = req1.compute_size();
-        builder.add(RaftCommand::new(req1, Callback::None), size);
-        let size = req2.compute_size();
-        builder.add(RaftCommand::new(req2, Callback::None), size);
     }
 }

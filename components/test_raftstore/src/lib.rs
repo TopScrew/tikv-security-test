@@ -4,6 +4,8 @@
 #![feature(trait_alias)]
 
 #[macro_use]
+extern crate lazy_static;
+#[macro_use]
 extern crate tikv_util;
 
 mod cluster;

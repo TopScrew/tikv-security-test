@@ -155,11 +155,9 @@ mod test {
     use std::thread;
 
     use tikv_util::{config::ReadableDuration, resizable_threadpool::ResizableRuntime};
-    use tokio::runtime::Runtime;
+    use tokio::{io::Result as TokioResult, runtime::Runtime};
 
     use super::*;
-
-    type TokioResult<T> = std::io::Result<T>;
 
     fn create_tokio_runtime(_: usize, _: &str) -> TokioResult<Runtime> {
         tokio::runtime::Builder::new_multi_thread()
@@ -305,14 +303,14 @@ mod test {
         assert!(switcher.region_in_import_mode(&region2));
         assert!(switcher.region_in_import_mode(&region3));
 
-        switcher.start_resizable_threads(&handle);
+        switcher.start_resizable_threads(&handle.clone());
 
         thread::sleep(Duration::from_millis(400));
         // renew the timeout of key_range2
         switcher.ranges_enter_import_mode(vec![key_range2]);
         thread::sleep(Duration::from_millis(400));
 
-        handle.block_on(tokio::task::yield_now());
+        threads.block_on(tokio::task::yield_now());
 
         // the range covering region and region2 should be cleared due to timeout.
         assert!(!switcher.region_in_import_mode(&region));
@@ -320,7 +318,7 @@ mod test {
         assert!(switcher.region_in_import_mode(&region3));
 
         thread::sleep(Duration::from_millis(400));
-        handle.block_on(tokio::task::yield_now());
+        threads.block_on(tokio::task::yield_now());
         assert!(!switcher.region_in_import_mode(&region3));
     }
 }

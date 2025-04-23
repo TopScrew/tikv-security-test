@@ -205,7 +205,7 @@ pub async fn with_resource_limiter<F: Future>(
     }
 }
 
-#[cfg(all(test, feature = "failpoints"))]
+#[cfg(test)]
 mod tests {
     use std::sync::mpsc::{channel, Sender};
 
@@ -242,6 +242,7 @@ mod tests {
     #[allow(clippy::unused_async)]
     async fn empty() {}
 
+    #[cfg(feature = "failpoints")]
     #[test]
     fn test_limited_future() {
         let pool = YatpPoolBuilder::new(DefaultTicker::default())
