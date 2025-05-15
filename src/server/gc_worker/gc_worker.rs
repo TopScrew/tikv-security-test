@@ -9,13 +9,12 @@ use std::{
         mpsc::Sender,
         Arc, Mutex,
     },
-    time::Duration,
     vec::IntoIter,
 };
 
 use api_version::{ApiV2, KvFormat};
 use collections::HashMap;
-use concurrency_manager::{ActionOnInvalidMaxTs, ConcurrencyManager};
+use concurrency_manager::ConcurrencyManager;
 use engine_rocks::{FlowInfo, RocksEngine};
 use engine_traits::{
     raw_ttl::ttl_current_ts, DeleteStrategy, Error as EngineError, KvEngine, MiscExt, Range,
@@ -369,14 +368,7 @@ impl<E: Engine> GcRunnerCore<E> {
 
     fn new_txn() -> MvccTxn {
         // TODO txn only used for GC, but this is hacky, maybe need an Option?
-        // a dummy cm
-        let concurrency_manager = ConcurrencyManager::new_with_config(
-            1.into(),
-            Duration::from_secs(45),
-            ActionOnInvalidMaxTs::Log,
-            None,
-            Duration::from_secs(46),
-        );
+        let concurrency_manager = ConcurrencyManager::new(1.into());
         MvccTxn::new(TimeStamp::zero(), concurrency_manager)
     }
 
@@ -1151,18 +1143,13 @@ pub fn schedule_gc(
     safe_point: TimeStamp,
     callback: Callback<()>,
 ) -> Result<()> {
-    let task = GcTask::Gc {
-        region,
-        safe_point,
-        callback,
-    };
-    if fail::eval("schedule_gc_full", |_| true).is_some() {
-        handle_gc_task_schedule_error(ScheduleError::Full(task))
-    } else {
-        scheduler
-            .schedule(task)
-            .or_else(handle_gc_task_schedule_error)
-    }
+    scheduler
+        .schedule(GcTask::Gc {
+            region,
+            safe_point,
+            callback,
+        })
+        .or_else(handle_gc_task_schedule_error)
 }
 
 /// Does GC synchronously.

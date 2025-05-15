@@ -28,10 +28,7 @@ use backup_stream::{
 };
 use causal_ts::CausalTsProviderImpl;
 use cdc::CdcConfigManager;
-use concurrency_manager::{
-    ActionOnInvalidMaxTs, ConcurrencyManager, DEFAULT_MAX_TS_DRIFT_ALLOWANCE,
-    DEFAULT_MAX_TS_SYNC_INTERVAL, LIMIT_VALID_TIME_MULTIPLIER,
-};
+use concurrency_manager::ConcurrencyManager;
 use engine_rocks::{
     from_rocks_compression_type, RocksCompactedEvent, RocksEngine, RocksStatistics,
 };
@@ -125,9 +122,7 @@ use tikv::{
         Engine, Storage,
     },
 };
-use tikv_alloc::{
-    add_thread_memory_accessor, remove_thread_memory_accessor, thread_allocate_exclusive_arena,
-};
+use tikv_alloc::{add_thread_memory_accessor, remove_thread_memory_accessor};
 use tikv_util::{
     check_environment_variables,
     config::VersionTrack,
@@ -183,7 +178,6 @@ fn run_impl<CER, F>(
     tikv.init_metrics_flusher(fetcher, engines_info);
     tikv.init_cgroup_monitor();
     tikv.init_storage_stats_task(engines);
-    tikv.init_max_ts_updater();
     tikv.run_server(server_config);
     tikv.run_status_server(in_memory_engine);
     tikv.core.init_quota_tuning_task(tikv.quota_limiter.clone());
@@ -335,7 +329,7 @@ where
 
                     // SAFETY: we will call `remove_thread_memory_accessor` at before_stop.
                     unsafe { add_thread_memory_accessor() };
-                    thread_allocate_exclusive_arena().unwrap();
+                    tikv_alloc::thread_allocate_exclusive_arena().unwrap();
                 })
                 .before_stop(|| {
                     remove_thread_memory_accessor();
@@ -407,13 +401,7 @@ where
 
         // Initialize concurrency manager
         let latest_ts = block_on(pd_client.get_tso()).expect("failed to get timestamp from PD");
-        let concurrency_manager = ConcurrencyManager::new_with_config(
-            latest_ts,
-            DEFAULT_MAX_TS_SYNC_INTERVAL * LIMIT_VALID_TIME_MULTIPLIER,
-            ActionOnInvalidMaxTs::Log,
-            Some(pd_client.clone()),
-            DEFAULT_MAX_TS_DRIFT_ALLOWANCE,
-        );
+        let concurrency_manager = ConcurrencyManager::new(latest_ts);
 
         // use different quota for front-end and back-end requests
         let quota_limiter = Arc::new(QuotaLimiter::new(
@@ -716,7 +704,6 @@ where
                 ttl_scheduler,
                 flow_controller,
                 storage.get_scheduler(),
-                storage.get_concurrency_manager(),
             )),
         );
 
@@ -1146,7 +1133,7 @@ where
         // Create Debugger.
         let mut debugger = DebuggerImpl::new(
             Engines::new(engines.engines.kv.clone(), engines.engines.raft.clone()),
-            cfg_controller.clone(),
+            self.cfg_controller.as_ref().unwrap().clone(),
             Some(storage),
         );
         debugger.set_kv_statistics(self.kv_statistics.clone());
@@ -1165,28 +1152,6 @@ where
         });
 
         server_config
-    }
-
-    fn init_max_ts_updater(&self) {
-        let cm = self.concurrency_manager.clone();
-        let pd_client = self.pd_client.clone();
-
-        let max_ts_sync_interval = DEFAULT_MAX_TS_SYNC_INTERVAL;
-        self.core
-            .background_worker
-            .spawn_interval_async_task(max_ts_sync_interval, move || {
-                let cm = cm.clone();
-                let pd_client = pd_client.clone();
-
-                async move {
-                    let pd_tso = pd_client.get_tso().await;
-                    if let Ok(ts) = pd_tso {
-                        cm.set_max_ts_limit(ts);
-                    } else {
-                        warn!("failed to get tso from pd in background, the max_ts validity check could be skipped");
-                    }
-                }
-            });
     }
 
     fn register_services(&mut self) {
@@ -1420,10 +1385,6 @@ where
         let snap_mgr = self.snap_mgr.clone().unwrap();
         let reserve_space = disk::get_disk_reserved_space();
         let reserve_raft_space = disk::get_raft_disk_reserved_space();
-        let need_update_disk_status = reserve_space != 0 || reserve_raft_space != 0;
-        if !need_update_disk_status {
-            info!("ignore updating disk status as no reserve space is set");
-        }
         let raft_path = engines.raft.get_engine_path().to_string();
         let separated_raft_mount_path =
             path_in_diff_mount_point(raft_path.as_str(), engines.kv.path());
@@ -1501,7 +1462,9 @@ where
                     );
                 }
                 // Update disk status if disk space checker is enabled.
-                if need_update_disk_status {
+                if reserve_space == 0 && reserve_raft_space == 0 {
+                    info!("ignore updating disk status as no reserve space is set");
+                } else {
                     disk::set_disk_status(cur_disk_status);
                 }
                 // Update disk capacity, used size and available size.
@@ -1751,8 +1714,7 @@ where
         } else {
             None
         };
-        let in_memory_engine_config_manager =
-            InMemoryEngineConfigManager::new(in_memory_engine_config);
+        let in_memory_engine_config_manager = InMemoryEngineConfigManager(in_memory_engine_config);
         self.kv_statistics = Some(factory.rocks_statistics());
         self.in_memory_engine_statistics = Some(in_memory_engine_statistics);
         let engines = Engines::new(kv_engine.clone(), raft_engine);

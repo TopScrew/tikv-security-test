@@ -86,7 +86,6 @@ make_auto_flush_static_metric! {
         started,
         timeout,
         finished,
-        stale,
     }
 
     pub label_enum CompactionGuardAction {
@@ -272,13 +271,6 @@ make_static_metric! {
         finished,
     }
 
-    pub label_enum SnapshotGenerateBytesType {
-        kv,
-        sst,
-        plain,
-        io,
-    }
-
     pub struct SnapshotBrWaitApplyEvent : IntCounter {
         "event" => SnapshotBrWaitApplyEventType
     }
@@ -346,10 +338,6 @@ make_static_metric! {
             raftstore_busy,
             applystore_busy,
         },
-    }
-
-    pub struct SnapshotGenerateBytesTypeVec: IntCounter {
-        "type" => SnapshotGenerateBytesType,
     }
 }
 
@@ -959,11 +947,9 @@ lazy_static! {
         &["type"]
     ).unwrap();
 
-    pub static ref SNAPSHOT_LIMIT_GENERATE_BYTES_VEC: SnapshotGenerateBytesTypeVec = register_static_int_counter_vec!(
-        SnapshotGenerateBytesTypeVec,
+    pub static ref SNAPSHOT_LIMIT_GENERATE_BYTES: IntCounter = register_int_counter!(
         "tikv_snapshot_limit_generate_bytes",
         "Total snapshot generate limit used",
-        &["type"],
     )
     .unwrap();
 

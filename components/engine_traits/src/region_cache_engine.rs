@@ -2,8 +2,6 @@
 
 use std::{
     fmt::{self, Debug},
-    future::Future,
-    pin::Pin,
     result,
 };
 
@@ -24,9 +22,7 @@ pub enum FailedReason {
     EpochNotMatch,
 }
 
-pub type OnEvictFinishedCallback =
-    Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
-
+#[derive(Debug, PartialEq)]
 pub enum RegionEvent {
     Split {
         source: CacheRegion,
@@ -39,7 +35,6 @@ pub enum RegionEvent {
     Eviction {
         region: CacheRegion,
         reason: EvictReason,
-        on_evict_finished: Option<OnEvictFinishedCallback>,
     },
     // range eviction triggered by delete_range
     // we should evict all cache regions that overlaps with this range
@@ -47,44 +42,6 @@ pub enum RegionEvent {
         range: CacheRegion,
         reason: EvictReason,
     },
-}
-
-impl fmt::Debug for RegionEvent {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            RegionEvent::Split {
-                source,
-                new_regions,
-            } => f
-                .debug_struct("RegionEvent::Split")
-                .field("source", source)
-                .field("new_regions", new_regions)
-                .finish(),
-            RegionEvent::TryLoad {
-                region,
-                for_manual_range,
-            } => f
-                .debug_struct("RegionEvent::TryLoad")
-                .field("region", region)
-                .field("for_manual_range", for_manual_range)
-                .finish(),
-            RegionEvent::Eviction {
-                region,
-                reason,
-                on_evict_finished,
-            } => f
-                .debug_struct("RegionEvent::Eviction")
-                .field("region", region)
-                .field("reason", reason)
-                .field("on_evict_finished", &on_evict_finished.is_some())
-                .finish(),
-            RegionEvent::EvictByRange { range, reason } => f
-                .debug_struct("RegionEvent::EvictByRange")
-                .field("range", range)
-                .field("reason", reason)
-                .finish(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -95,14 +52,12 @@ pub enum EvictReason {
     BecomeFollower,
     AutoEvict,
     DeleteRange,
-    PrepareMerge,
     Merge,
     Disabled,
     ApplySnapshot,
     Flashback,
     Manual,
-    DestroyPeer,
-    IngestSST,
+    PeerDestroy,
 }
 
 /// RegionCacheEngine works as a region cache caching some regions (in Memory or
@@ -139,7 +94,7 @@ pub trait RegionCacheEngineExt {
     // region cache engine and kv engine
     fn on_region_event(&self, event: RegionEvent);
 
-    fn region_cached(&self, region: &Region, active_only: bool) -> bool;
+    fn region_cached(&self, region: &Region) -> bool;
 
     fn load_region(&self, region: &Region);
 }

@@ -77,6 +77,7 @@ use crate::{
     store::{
         cmd_resp::{bind_term, new_error},
         demote_failed_voters_request,
+        entry_storage::MAX_WARMED_UP_CACHE_KEEP_TIME,
         fsm::{
             apply,
             store::{PollContext, StoreMeta},
@@ -88,7 +89,10 @@ use crate::{
         memory::*,
         metrics::*,
         msg::{Callback, CampaignType, ExtCallback, InspectedRaftMessage},
-        peer::{ConsistencyState, Peer, PersistSnapshotResult, StaleState, TransferLeaderContext},
+        peer::{
+            ConsistencyState, Peer, PersistSnapshotResult, StaleState,
+            TRANSFER_LEADER_COMMAND_REPLY_CTX,
+        },
         region_meta::RegionMeta,
         snapshot_backup::{AbortReason, SnapshotBrState, SnapshotBrWaitApplyRequest},
         transport::Transport,
@@ -797,9 +801,6 @@ where
             if self.fsm.batch_req_builder.request.is_some() {
                 self.ctx.raft_metrics.ready.propose_delay.inc();
             }
-        }
-        if self.fsm.peer.maybe_ack_transfer_leader_msg(self.ctx) {
-            self.fsm.has_ready = true;
         }
     }
 
@@ -2060,8 +2061,13 @@ where
         let low = res.low;
         // If the peer is not the leader anymore and it's not in entry cache warmup
         // state, or it is being destroyed, ignore the result.
-        let cache_warmup_state = &self.fsm.peer.transfer_leader_state.cache_warmup_state;
-        if !self.fsm.peer.is_leader() && cache_warmup_state.is_none()
+        if !self.fsm.peer.is_leader()
+            && self
+                .fsm
+                .peer
+                .get_store()
+                .entry_cache_warmup_state()
+                .is_none()
             || self.fsm.peer.pending_remove
         {
             self.fsm.peer.mut_store().clean_async_fetch_res(low);
@@ -2071,12 +2077,17 @@ where
         if self.fsm.peer.term() != res.term {
             // term has changed, the result may be not correct.
             self.fsm.peer.mut_store().clean_async_fetch_res(low);
-        } else if let Some(state) = &self.fsm.peer.transfer_leader_state.cache_warmup_state {
-            self.fsm
-                .peer
-                .raft_group
-                .mut_store()
-                .on_async_warm_up_entry_cache_fetched(*res, state.range());
+        } else if self
+            .fsm
+            .peer
+            .get_store()
+            .entry_cache_warmup_state()
+            .is_some()
+        {
+            if self.fsm.peer.mut_store().maybe_warm_up_entry_cache(*res) {
+                self.fsm.peer.ack_transfer_leader_msg(false);
+                self.fsm.has_ready = true;
+            }
             self.fsm.peer.mut_store().clean_async_fetch_res(low);
             return;
         } else {
@@ -2515,9 +2526,6 @@ where
                     .peer
                     .region_buckets_info_mut()
                     .add_bucket_flow(&res.bucket_stat);
-                // Update the state whether the peer is pending on applying raft
-                // logs if necesssary.
-                self.on_check_peer_complete_apply_logs();
 
                 self.fsm.has_ready |= self.fsm.peer.post_apply(
                     self.ctx,
@@ -3074,6 +3082,9 @@ where
     }
 
     fn on_extra_message(&mut self, mut msg: RaftMessage) {
+        self.ctx
+            .coprocessor_host
+            .on_extra_message(self.fsm.peer.region(), msg.get_extra_msg());
         match msg.get_extra_msg().get_type() {
             ExtraMessageType::MsgRegionWakeUp | ExtraMessageType::MsgCheckStalePeer => {
                 if msg.get_extra_msg().forcely_awaken {
@@ -3744,8 +3755,6 @@ where
     fn on_transfer_leader_msg(&mut self, msg: &eraftpb::Message, peer_disk_usage: DiskUsage) {
         // log_term is set by original leader, represents the term last log is written
         // in, which should be equal to the original leader's term.
-        //
-        // See more in `Peer::pre_transfer_leader`.
         if msg.get_log_term() != self.fsm.peer.term() {
             return;
         }
@@ -3807,13 +3816,9 @@ where
             .fsm
             .peer
             .maybe_reject_transfer_leader_msg(self.ctx, msg, peer_disk_usage)
+            && self.fsm.peer.pre_ack_transfer_leader_msg(self.ctx, msg)
         {
-            self.fsm
-                .peer
-                .set_pending_transfer_leader_msg(&self.ctx.cfg, msg);
-            if self.fsm.peer.maybe_ack_transfer_leader_msg(self.ctx) {
-                self.fsm.has_ready = true;
-            }
+            self.fsm.peer.ack_transfer_leader_msg(false);
         }
     }
 
@@ -3830,25 +3835,14 @@ where
         let txn_ext = self.fsm.peer.txn_ext.clone();
         let mut pessimistic_locks = txn_ext.pessimistic_locks.write();
 
-        // If the message context == TransferLeaderContext::CommandReply, the message
+        // If the message context == TRANSFER_LEADER_COMMAND_REPLY_CTX, the message
         // is a reply to a transfer leader command before. If the locks status remain
         // in the TransferringLeader status, we can safely initiate transferring leader
         // now.
         // If it's not in TransferringLeader status now, it is probably because several
         // ticks have passed after proposing the locks in the last time and we
         // reactivate the memory locks. Then, we should propose the locks again.
-        let context = match TransferLeaderContext::from_bytes(msg.get_context()) {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                warn!("failed to decode transfer leader context";
-                    "region_id" => self.fsm.region_id(),
-                    "peer_id" => self.fsm.peer_id(),
-                    "from" => ?msg.get_from(),
-                    "err" => ?e);
-                TransferLeaderContext::None
-            }
-        };
-        if matches!(context, TransferLeaderContext::CommandReply)
+        if msg.get_context() == TRANSFER_LEADER_COMMAND_REPLY_CTX
             && pessimistic_locks.status == LocksStatus::TransferringLeader
         {
             return false;
@@ -4430,8 +4424,8 @@ where
     fn on_ready_compact_log(&mut self, first_index: u64, state: RaftTruncatedState) {
         // Since this peer may be warming up the entry cache, log compaction should be
         // temporarily skipped. Otherwise, the warmup task may fail.
-        if let Some(state) = &mut self.fsm.peer.transfer_leader_state.cache_warmup_state {
-            if !state.check_stale() {
+        if let Some(state) = self.fsm.peer.mut_store().entry_cache_warmup_state_mut() {
+            if !state.check_stale(MAX_WARMED_UP_CACHE_KEEP_TIME) {
                 return;
             }
         }
@@ -4444,11 +4438,7 @@ where
         let compact_to = state.get_index() + 1;
         self.fsm.peer.schedule_raftlog_gc(self.ctx, compact_to);
         self.fsm.peer.last_compacted_idx = compact_to;
-        let transfer_leader_state = &mut self.fsm.peer.transfer_leader_state;
-        self.fsm.peer.raft_group.mut_store().on_compact_raftlog(
-            compact_to,
-            transfer_leader_state.cache_warmup_state.as_mut(),
-        );
+        self.fsm.peer.mut_store().on_compact_raftlog(compact_to);
         if self.fsm.peer.is_witness() {
             self.fsm.peer.last_compacted_time = Instant::now();
         }
@@ -5563,12 +5553,10 @@ where
                     raft_engine.consume(&mut batch, true).unwrap();
 
                     {
-                        self.fsm.peer.transfer_leader_state.cache_warmup_state = None;
-                        let cache_warmup_state =
-                            &mut self.fsm.peer.transfer_leader_state.cache_warmup_state;
-                        let peer_store = self.fsm.peer.raft_group.mut_store();
+                        let peer_store = self.fsm.peer.mut_store();
                         peer_store.set_apply_state(apply_state);
-                        peer_store.compact_entry_cache(last_index + 1, cache_warmup_state.as_mut());
+                        peer_store.clear_entry_cache_warmup_state();
+                        peer_store.compact_entry_cache(last_index + 1);
                         peer_store.raft_state_mut().mut_hard_state().commit = last_index;
                         peer_store.raft_state_mut().last_index = last_index;
                     }
@@ -6101,11 +6089,10 @@ where
 
         // leader may call `get_term()` on the latest replicated index, so compact
         // entries before `alive_cache_idx` instead of `alive_cache_idx + 1`.
-        let transfer_leader_state = &mut self.fsm.peer.transfer_leader_state;
-        self.fsm.peer.raft_group.mut_store().on_compact_raftlog(
-            std::cmp::min(alive_cache_idx, applied_idx + 1),
-            transfer_leader_state.cache_warmup_state.as_mut(),
-        );
+        self.fsm
+            .peer
+            .mut_store()
+            .compact_entry_cache(std::cmp::min(alive_cache_idx, applied_idx + 1));
         if needs_evict_entry_cache(self.ctx.cfg.evict_cache_on_memory_ratio) {
             self.fsm.peer.mut_store().evict_entry_cache(true);
             if !self.fsm.peer.get_store().is_entry_cache_empty() {

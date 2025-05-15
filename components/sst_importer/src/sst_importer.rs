@@ -39,12 +39,14 @@ use tikv_util::{
     },
     future::RescheduleChecker,
     memory::{MemoryQuota, OwnedAllocated},
-    resizable_threadpool::DeamonRuntimeHandle,
     sys::{thread::ThreadBuildWrapper, SysQuota},
     time::{Instant, Limiter},
     Either, HandyRwLock,
 };
-use tokio::{runtime::Runtime, sync::OnceCell};
+use tokio::{
+    runtime::{Handle, Runtime},
+    sync::OnceCell,
+};
 use txn_types::{Key, TimeStamp, WriteRef};
 
 use crate::{
@@ -100,11 +102,6 @@ impl<'a> DownloadExt<'a> {
 pub enum CacheKvFile {
     Mem(Arc<OnceCell<LoadedFile>>),
     Fs(Arc<PathBuf>),
-    /// Tracks the state of a file download operation.
-    /// This struct is used to prevent duplicate downloads of the same file.
-    /// The `meta` field stores the SST file metadata, while `range` indicates
-    /// the key range affected by the download operation.
-    State(Arc<(SstMeta, OnceCell<Option<Range>>)>),
 }
 
 /// returns an error on an invalid internal state.
@@ -127,7 +124,6 @@ impl CacheKvFile {
                 Arc::strong_count(buff)
             }
             CacheKvFile::Fs(path) => Arc::strong_count(path),
-            CacheKvFile::State(state) => Arc::strong_count(state),
         }
     }
 
@@ -138,8 +134,6 @@ impl CacheKvFile {
             CacheKvFile::Mem(_) => start.saturating_elapsed() >= Duration::from_secs(60),
             // The expired duration for local file is 10min.
             CacheKvFile::Fs(_) => start.saturating_elapsed() >= Duration::from_secs(600),
-            // The expired duration for memory is 60s.
-            CacheKvFile::State(_) => start.saturating_elapsed() >= Duration::from_secs(60),
         }
     }
 }
@@ -273,10 +267,10 @@ impl<E: KvEngine> SstImporter<E> {
         }
     }
 
-    pub fn start_switch_mode_check(&self, executor: &DeamonRuntimeHandle, db: Option<E>) {
+    pub fn start_switch_mode_check(&self, executor: &Handle, db: Option<E>) {
         match &self.switcher {
-            Either::Left(switcher) => switcher.start_resizable_threads(executor, db.unwrap()),
-            Either::Right(switcher) => switcher.start_resizable_threads(executor),
+            Either::Left(switcher) => switcher.start(executor, db.unwrap()),
+            Either::Right(switcher) => switcher.start(executor),
         }
     }
 
@@ -600,13 +594,6 @@ impl<E: KvEngine> SstImporter<E> {
                         retain_file_count += 1;
                     }
                 }
-                // regular check, normally the lock will resolved immediately
-                CacheKvFile::State(_) => {
-                    if c.ref_count() == 1 && c.is_expired(start) {
-                        CACHE_EVENT.with_label_values(&["remain-locks"]).inc();
-                        need_retain = false;
-                    }
-                }
             }
 
             need_retain
@@ -905,7 +892,6 @@ impl<E: KvEngine> SstImporter<E> {
                 }
                 Ok(Arc::from(buffer.into_boxed_slice()))
             }
-            _ => unreachable!(),
         }
     }
 
@@ -1175,67 +1161,7 @@ impl<E: KvEngine> SstImporter<E> {
         ext: DownloadExt<'_>,
     ) -> Result<Option<Range>> {
         let path = self.dir.join_for_write(meta)?;
-        let path_str = path.temp.to_string_lossy().to_string();
 
-        let res = {
-            match self.file_locks.entry(path_str.clone()) {
-                Entry::Occupied(mut entry) => match entry.get_mut() {
-                    (CacheKvFile::State(state), last_used) => {
-                        // safety check
-                        if state.0 != *meta {
-                            error!("same uuid, but different download meta"; "meta" => ?meta, "name" => name);
-                            return Err(Error::MisMatchRequest);
-                        }
-                        // Another download is already in progress
-                        info!("duplicate download request ignored"; "meta" => ?meta, "name" => name);
-                        *last_used = Instant::now();
-                        Arc::clone(state)
-                    }
-                    _ => {
-                        error!("mismatched request type for download"; "meta" => ?meta, "name" => name);
-                        return Err(Error::MisMatchRequest);
-                    }
-                },
-                Entry::Vacant(entry) => {
-                    // We're the first one, insert our marker and proceed with download
-                    let cache = Arc::new((meta.clone(), OnceCell::new()));
-                    entry.insert((CacheKvFile::State(Arc::clone(&cache)), Instant::now()));
-                    cache
-                }
-            }
-        };
-        defer! {{self.file_locks.remove(&path_str);}}
-
-        res.1
-            .get_or_try_init(|| {
-                self.do_download_ext_after_lock_check(
-                    path,
-                    meta,
-                    backend,
-                    name,
-                    rewrite_rule,
-                    crypter,
-                    speed_limiter,
-                    engine,
-                    ext,
-                )
-            })
-            .await
-            .map(|r| r.to_owned())
-    }
-
-    async fn do_download_ext_after_lock_check(
-        &self,
-        path: crate::import_file::ImportPath,
-        meta: &SstMeta,
-        backend: &StorageBackend,
-        name: &str,
-        rewrite_rule: &RewriteRule,
-        crypter: Option<CipherInfo>,
-        speed_limiter: &Limiter,
-        engine: E,
-        ext: DownloadExt<'_>,
-    ) -> Result<Option<Range>> {
         let file_crypter = crypter.map(|c| FileEncryptionInfo {
             method: c.cipher_type,
             key: c.cipher_key,
@@ -1313,8 +1239,6 @@ impl<E: KvEngine> SstImporter<E> {
         let direct_retval = (|| -> Result<Option<_>> {
             if rewrite_rule.old_key_prefix != rewrite_rule.new_key_prefix
                 || rewrite_rule.new_timestamp != 0
-                || rewrite_rule.ignore_after_timestamp != 0
-                || rewrite_rule.ignore_before_timestamp != 0
             {
                 // must iterate if we perform key rewrite
                 return Ok(None);
@@ -1441,29 +1365,6 @@ impl<E: KvEngine> SstImporter<E> {
 
             let mut value = Cow::Borrowed(iter.value());
 
-            if rewrite_rule.ignore_after_timestamp != 0 {
-                let ts = Key::decode_ts_from(iter.key())?;
-                if ts > TimeStamp::new(rewrite_rule.ignore_after_timestamp) {
-                    iter.next()?;
-                    INPORTER_DOWNLOAD_COMPACT_KEYS_COUNT
-                        .with_label_values(&["after"])
-                        .inc();
-                    continue;
-                }
-            }
-            if rewrite_rule.ignore_before_timestamp != 0 {
-                // Let the client decide the ts here for default/write CF.
-                // Normally the ts in default CF is less than the ts in write CF.
-                let ts = Key::decode_ts_from(iter.key())?;
-                if ts < TimeStamp::new(rewrite_rule.ignore_before_timestamp) {
-                    iter.next()?;
-                    INPORTER_DOWNLOAD_COMPACT_KEYS_COUNT
-                        .with_label_values(&["before"])
-                        .inc();
-                    continue;
-                }
-            }
-
             if rewrite_rule.new_timestamp != 0 {
                 data_key = Key::from_encoded(data_key)
                     .truncate_ts()
@@ -1476,7 +1377,7 @@ impl<E: KvEngine> SstImporter<E> {
                     })?
                     .append_ts(TimeStamp::new(rewrite_rule.new_timestamp))
                     .into_encoded();
-                if cf_name == CF_WRITE {
+                if meta.get_cf_name() == CF_WRITE {
                     let mut write = WriteRef::parse(iter.value()).map_err(|e| {
                         Error::BadFormat(format!(
                             "write {}: {}",
@@ -1723,10 +1624,6 @@ mod tests {
     use std::{
         io::{self, Cursor},
         ops::Sub,
-        sync::{
-            atomic::{AtomicUsize, Ordering},
-            Mutex,
-        },
         usize,
     };
 
@@ -1750,28 +1647,14 @@ mod tests {
     use tempfile::{Builder, TempDir};
     use test_sst_importer::*;
     use test_util::new_test_key_manager;
-    use tikv_util::{
-        codec::stream_event::EventEncoder, resizable_threadpool::ResizableRuntime,
-        stream::block_on_external_io,
-    };
-    use tokio::{
-        io::{AsyncWrite, AsyncWriteExt, Result as TokioResult},
-        runtime::Runtime,
-    };
+    use tikv_util::{codec::stream_event::EventEncoder, stream::block_on_external_io};
+    use tokio::io::{AsyncWrite, AsyncWriteExt};
     use tokio_util::compat::{FuturesAsyncWriteCompatExt, TokioAsyncWriteCompatExt};
     use txn_types::{Value, WriteType};
     use uuid::Uuid;
 
     use super::*;
     use crate::{import_file::ImportPath, *};
-
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-    fn create_tokio_runtime(_: usize, _: &str) -> TokioResult<Runtime> {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-    }
 
     fn do_test_import_dir(key_manager: Option<Arc<DataKeyManager>>) {
         let temp_dir = Builder::new().prefix("test_import_dir").tempdir().unwrap();
@@ -2243,19 +2126,6 @@ mod tests {
         Ok((ext_sst_dir, backend, meta))
     }
 
-    fn new_compacted_file_rewrite_rule(
-        old_key_prefix: &[u8],
-        new_key_prefix: &[u8],
-        new_timestamp: u64,
-        ignore_before_timestamp: u64,
-        ignore_after_timestamp: u64,
-    ) -> RewriteRule {
-        let mut rule = new_rewrite_rule(old_key_prefix, new_key_prefix, new_timestamp);
-        rule.ignore_before_timestamp = ignore_before_timestamp;
-        rule.ignore_after_timestamp = ignore_after_timestamp;
-        rule
-    }
-
     fn new_rewrite_rule(
         old_key_prefix: &[u8],
         new_key_prefix: &[u8],
@@ -2424,17 +2294,8 @@ mod tests {
         };
         let change = cfg.diff(&cfg_new);
 
-        let threads = ResizableRuntime::new(
-            cfg.num_threads,
-            "test",
-            Box::new(create_tokio_runtime),
-            Box::new(|_| {}),
-        );
-
-        let threads_clone = Arc::new(Mutex::new(threads));
-
         // create config manager and update config.
-        let mut cfg_mgr = ImportConfigManager::new(cfg, Arc::downgrade(&threads_clone));
+        let mut cfg_mgr = ImportConfigManager::new(cfg);
         cfg_mgr.dispatch(change).unwrap();
         importer.update_config_memory_use_ratio(&cfg_mgr);
 
@@ -2457,48 +2318,9 @@ mod tests {
             ..Default::default()
         };
         let change = cfg.diff(&cfg_new);
-
-        let threads = ResizableRuntime::new(
-            cfg.num_threads,
-            "test",
-            Box::new(create_tokio_runtime),
-            Box::new(|_| {}),
-        );
-
-        let threads_clone = Arc::new(Mutex::new(threads));
-
-        let mut cfg_mgr = ImportConfigManager::new(cfg, Arc::downgrade(&threads_clone));
+        let mut cfg_mgr = ImportConfigManager::new(cfg);
         let r = cfg_mgr.dispatch(change);
         assert!(r.is_err());
-    }
-
-    #[test]
-    fn test_update_import_num_threads() {
-        let cfg = Config::default();
-        let threads = ResizableRuntime::new(
-            Config::default().num_threads,
-            "test",
-            Box::new(create_tokio_runtime),
-            Box::new(|new_size: usize| {
-                COUNTER.store(new_size, Ordering::SeqCst);
-            }),
-        );
-
-        let threads_clone = Arc::new(Mutex::new(threads));
-        let mut cfg_mgr = ImportConfigManager::new(cfg, Arc::downgrade(&threads_clone));
-
-        assert_eq!(cfg_mgr.rl().num_threads, Config::default().num_threads);
-
-        let cfg_new = Config {
-            num_threads: 10,
-            ..Default::default()
-        };
-        let change = Config::default().diff(&cfg_new);
-        let r = cfg_mgr.dispatch(change);
-
-        r.unwrap();
-        assert_eq!(cfg_mgr.rl().num_threads, cfg_new.num_threads);
-        assert_eq!(COUNTER.load(Ordering::SeqCst), cfg_mgr.rl().num_threads);
     }
 
     #[test]
@@ -2969,206 +2791,6 @@ mod tests {
                 (get_encoded_key(b"t123_r07", 16), b"pqrst".to_vec()),
             ]
         );
-    }
-    #[test]
-    fn test_download_compacted_sst_with_key_rewrite_ts_default() {
-        // performs the download.
-        let importer_dir = tempfile::tempdir().unwrap();
-        let cfg = Config::default();
-        let importer =
-            SstImporter::<TestEngine>::new(&cfg, &importer_dir, None, ApiVersion::V1, false)
-                .unwrap();
-
-        // creates a sample SST file.
-        let (_ext_sst_dir, backend, meta) = create_sample_external_sst_file_txn_default().unwrap();
-        let db = create_sst_test_engine().unwrap();
-        let downloads = vec![
-            (
-                // no filter
-                new_compacted_file_rewrite_rule(b"t123", b"t567", 0, 0, 0),
-                vec![
-                    (get_encoded_key(b"t567_r01", 1), b"abc".to_vec()),
-                    (get_encoded_key(b"t567_r04", 3), b"xyz".to_vec()),
-                    (get_encoded_key(b"t567_r07", 7), b"pqrst".to_vec()),
-                ],
-            ),
-            (
-                // filter key between ts range [2, 6],
-                new_compacted_file_rewrite_rule(b"t123", b"t123", 0, 2, 6),
-                vec![(get_encoded_key(b"t123_r04", 3), b"xyz".to_vec())],
-            ),
-            (
-                // filter key between ts range [7, 18]
-                new_compacted_file_rewrite_rule(b"t123", b"t567", 0, 7, 18),
-                vec![(get_encoded_key(b"t567_r07", 7), b"pqrst".to_vec())],
-            ),
-        ];
-        for case in downloads {
-            let _ = importer
-                .download(
-                    &meta,
-                    &backend,
-                    "sample_default.sst",
-                    &case.0,
-                    None,
-                    Limiter::new(f64::INFINITY),
-                    db.clone(),
-                )
-                .unwrap()
-                .unwrap();
-
-            // verifies that the file is saved to the correct place.
-            // (the file size may be changed, so not going to check the file size)
-            let sst_file_path = importer.dir.join_for_read(&meta).unwrap().save;
-            assert!(sst_file_path.is_file());
-
-            // verifies the SST content is correct.
-            let sst_reader = new_sst_reader(sst_file_path.to_str().unwrap(), None);
-            sst_reader.verify_checksum().unwrap();
-            let mut iter = sst_reader.iter(IterOptions::default()).unwrap();
-            iter.seek_to_first().unwrap();
-            assert_eq!(collect(iter), case.1);
-        }
-    }
-
-    #[test]
-    fn test_download_compacted_sst_with_key_rewrite_ts_write() {
-        // performs the download.
-        let importer_dir = tempfile::tempdir().unwrap();
-        let cfg = Config::default();
-        let importer =
-            SstImporter::<TestEngine>::new(&cfg, &importer_dir, None, ApiVersion::V1, false)
-                .unwrap();
-
-        // creates a sample SST file.
-        let (_ext_sst_dir, backend, meta) = create_sample_external_sst_file_txn_write().unwrap();
-        let db = create_sst_test_engine().unwrap();
-        let downloads = vec![
-            (
-                // filter key between ts range [4, 8]
-                new_compacted_file_rewrite_rule(b"t123", b"t567", 0, 4, 8),
-                vec![
-                    (
-                        get_encoded_key(b"t567_r01", 5),
-                        get_write_value(WriteType::Put, 1, None),
-                    ),
-                    (
-                        get_encoded_key(b"t567_r02", 5),
-                        get_write_value(WriteType::Delete, 1, None),
-                    ),
-                    (
-                        get_encoded_key(b"t567_r04", 4),
-                        get_write_value(WriteType::Put, 3, None),
-                    ),
-                    (
-                        get_encoded_key(b"t567_r07", 8),
-                        get_write_value(WriteType::Put, 7, None),
-                    ),
-                    (
-                        get_encoded_key(b"t567_r13", 8),
-                        get_write_value(WriteType::Put, 7, Some(b"www".to_vec())),
-                    ),
-                ],
-            ),
-            (
-                // filter key between ts range [5, 6]
-                new_compacted_file_rewrite_rule(b"t123", b"t567", 0, 5, 6),
-                vec![
-                    (
-                        get_encoded_key(b"t567_r01", 5),
-                        get_write_value(WriteType::Put, 1, None),
-                    ),
-                    (
-                        get_encoded_key(b"t567_r02", 5),
-                        get_write_value(WriteType::Delete, 1, None),
-                    ),
-                ],
-            ),
-            (
-                // filter key between ts range [4, 5]
-                new_compacted_file_rewrite_rule(b"t123", b"t567", 0, 4, 5),
-                vec![
-                    (
-                        get_encoded_key(b"t567_r01", 5),
-                        get_write_value(WriteType::Put, 1, None),
-                    ),
-                    (
-                        get_encoded_key(b"t567_r02", 5),
-                        get_write_value(WriteType::Delete, 1, None),
-                    ),
-                    (
-                        get_encoded_key(b"t567_r04", 4),
-                        get_write_value(WriteType::Put, 3, None),
-                    ),
-                ],
-            ),
-            (
-                // no filter
-                new_compacted_file_rewrite_rule(b"t123", b"t567", 0, 0, 0),
-                vec![
-                    (
-                        get_encoded_key(b"t567_r01", 5),
-                        get_write_value(WriteType::Put, 1, None),
-                    ),
-                    (
-                        get_encoded_key(b"t567_r02", 5),
-                        get_write_value(WriteType::Delete, 1, None),
-                    ),
-                    (
-                        get_encoded_key(b"t567_r04", 4),
-                        get_write_value(WriteType::Put, 3, None),
-                    ),
-                    (
-                        get_encoded_key(b"t567_r07", 8),
-                        get_write_value(WriteType::Put, 7, None),
-                    ),
-                    (
-                        get_encoded_key(b"t567_r13", 8),
-                        get_write_value(WriteType::Put, 7, Some(b"www".to_vec())),
-                    ),
-                ],
-            ),
-            (
-                // no rewrite rule, but has filter ts range [5, 5]
-                new_compacted_file_rewrite_rule(b"t123", b"t123", 0, 5, 5),
-                vec![
-                    (
-                        get_encoded_key(b"t123_r01", 5),
-                        get_write_value(WriteType::Put, 1, None),
-                    ),
-                    (
-                        get_encoded_key(b"t123_r02", 5),
-                        get_write_value(WriteType::Delete, 1, None),
-                    ),
-                ],
-            ),
-        ];
-        for case in downloads {
-            let _ = importer
-                .download(
-                    &meta,
-                    &backend,
-                    "sample_write.sst",
-                    &case.0,
-                    None,
-                    Limiter::new(f64::INFINITY),
-                    db.clone(),
-                )
-                .unwrap()
-                .unwrap();
-
-            // verifies that the file is saved to the correct place.
-            // (the file size may be changed, so not going to check the file size)
-            let sst_file_path = importer.dir.join_for_read(&meta).unwrap().save;
-            assert!(sst_file_path.is_file());
-
-            // verifies the SST content is correct.
-            let sst_reader = new_sst_reader(sst_file_path.to_str().unwrap(), None);
-            sst_reader.verify_checksum().unwrap();
-            let mut iter = sst_reader.iter(IterOptions::default()).unwrap();
-            iter.seek_to_first().unwrap();
-            assert_eq!(collect(iter), case.1);
-        }
     }
 
     #[test]

@@ -7,6 +7,8 @@ use std::{
         Bound::{self, Excluded, Unbounded},
     },
     fmt::Debug,
+    future::Future,
+    pin::Pin,
     result,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -15,13 +17,15 @@ use std::{
 };
 
 use collections::HashMap;
-use engine_traits::{CacheRegion, EvictReason, FailedReason, OnEvictFinishedCallback};
+use engine_traits::{CacheRegion, EvictReason, FailedReason};
 use futures::executor::block_on;
 use parking_lot::RwLock;
 use strum::EnumCount;
-use tikv_util::{debug, info, smoother::Smoother, time::Instant, warn};
+use tikv_util::{info, time::Instant, warn};
 
 use crate::{metrics::observe_eviction_duration, read::RegionCacheSnapshotMeta};
+
+pub(crate) trait AsyncFnOnce = FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>>;
 
 #[derive(PartialEq, Eq, Debug, Clone, Copy, Default, Hash, EnumCount)]
 #[repr(usize)]
@@ -105,16 +109,7 @@ impl SnapshotList {
     }
 }
 
-/// Estimates the smoothed coprocessor request rate over the last hour using a
-/// simple moving average.
-pub(crate) type CopRequestsSma = Smoother<f64, COP_REQUEST_SMA_RECORD_COUNT, ONE_HOUR_IN_SECS, 0>;
-/// Represents the number of seconds in an hour.
-const ONE_HOUR_IN_SECS: u64 = 60 * 60;
-/// The default interval for observing requests is 10 minutes
-/// (load_evict_interval), but this can be adjusted by users. To maintain
-/// accuracy, we double the record count for intervals smaller than the default.
-pub(crate) const COP_REQUEST_SMA_RECORD_COUNT: usize = 6 * 2;
-
+#[derive(Debug)]
 pub struct CacheRegionMeta {
     // the cached region meta.
     region: CacheRegion,
@@ -129,28 +124,13 @@ pub struct CacheRegionMeta {
     is_written: AtomicBool,
     // region eviction triggers info, and callback when eviction finishes.
     evict_info: Option<EvictInfo>,
-
-    average_cop_requests: Arc<Mutex<CopRequestsSma>>,
-}
-
-impl Debug for CacheRegionMeta {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CacheRegionMeta")
-            .field("region", &self.region)
-            .field("state", &self.state)
-            .field("safe_point", &self.safe_point)
-            .field("in_gc", &self.in_gc)
-            .field("is_written", &self.is_written)
-            .field("evict_info", &self.evict_info)
-            .finish()
-    }
 }
 
 struct EvictInfo {
     start: Instant,
     reason: EvictReason,
     // called when eviction finishes
-    on_evict_finished: Option<OnEvictFinishedCallback>,
+    cb: Option<Box<dyn AsyncFnOnce + Send + Sync>>,
 }
 
 impl Debug for EvictInfo {
@@ -171,7 +151,6 @@ impl CacheRegionMeta {
             in_gc: AtomicBool::new(false),
             is_written: AtomicBool::new(false),
             evict_info: None,
-            average_cop_requests: Arc::new(Mutex::new(Default::default())),
         }
     }
 
@@ -236,7 +215,7 @@ impl CacheRegionMeta {
         &mut self,
         state: RegionState,
         reason: EvictReason,
-        on_evict_finished: Option<OnEvictFinishedCallback>,
+        cb: Option<Box<dyn AsyncFnOnce + Send + Sync>>,
     ) {
         use RegionState::*;
         assert_matches!(self.state, Loading | Active | LoadingCanceled);
@@ -245,7 +224,7 @@ impl CacheRegionMeta {
         self.evict_info = Some(EvictInfo {
             start: Instant::now_coarse(),
             reason,
-            on_evict_finished,
+            cb,
         });
     }
 
@@ -274,9 +253,6 @@ impl CacheRegionMeta {
     // This method is currently only used for handling region split.
     pub(crate) fn derive_from(region: CacheRegion, source_meta: &Self) -> Self {
         assert!(source_meta.region.contains_range(&region));
-        let average_cop_requests = Arc::new(Mutex::new(
-            source_meta.average_cop_requests.lock().unwrap().clone(),
-        ));
         Self {
             region,
             region_snapshot_list: Mutex::new(SnapshotList::default()),
@@ -285,7 +261,6 @@ impl CacheRegionMeta {
             in_gc: AtomicBool::new(source_meta.in_gc.load(Ordering::Relaxed)),
             is_written: AtomicBool::new(source_meta.is_written.load(Ordering::Relaxed)),
             evict_info: None,
-            average_cop_requests,
         }
     }
 
@@ -326,20 +301,16 @@ impl RegionMetaMap {
         }
     }
 
-    /// Return Ok if it initiates load successfully, otherwise return the failed
-    /// reason.
     pub(crate) fn load_region(
         &mut self,
         cache_region: CacheRegion,
     ) -> Result<(), LoadFailedReason> {
         use RegionState::*;
-        if let Some((state, is_same_region)) = self.check_overlap_with_region(&cache_region) {
+        if let Some(state) = self.check_overlap_with_region(&cache_region) {
             let reason = match state {
-                Pending | Loading => LoadFailedReason::PendingRange(is_same_region),
-                Active => LoadFailedReason::Overlapped(is_same_region),
-                LoadingCanceled | PendingEvict | Evicting => {
-                    LoadFailedReason::Evicting(is_same_region)
-                }
+                Pending | Loading => LoadFailedReason::PendingRange,
+                Active => LoadFailedReason::Overlapped,
+                LoadingCanceled | PendingEvict | Evicting => LoadFailedReason::Evicting,
             };
             return Err(reason);
         }
@@ -384,11 +355,7 @@ impl RegionMetaMap {
     /// target region. If there are regions with `pending` state and whose
     /// epoch version is smaller than target region, the pending regions will
     /// be removed first.
-    ///
-    /// Return None if there is no overlap, otherwise return the state of the
-    /// overlapped region and a bool value indicating whether the overlapped
-    /// region is the same as the target region.
-    fn check_overlap_with_region(&mut self, region: &CacheRegion) -> Option<(RegionState, bool)> {
+    fn check_overlap_with_region(&mut self, region: &CacheRegion) -> Option<RegionState> {
         let mut removed_regions = vec![];
         let mut overlapped_region_state = None;
         self.iter_overlapped_regions(region, |region_meta| {
@@ -399,14 +366,10 @@ impl RegionMetaMap {
                 removed_regions.push(region_meta.region.id);
                 return true;
             }
-            let is_same_region = region_meta.region.id == region.id
-                && region_meta.region.epoch_version == region.epoch_version;
-            if !is_same_region {
-                warn!("ime load region overlaps with existing region";
+            warn!("ime load region overlaps with existing region";
                 "region" => ?region,
                 "exist_meta" => ?region_meta);
-            }
-            overlapped_region_state = Some((region_meta.state, is_same_region));
+            overlapped_region_state = Some(region_meta.state);
             false
         });
         if !removed_regions.is_empty() {
@@ -429,8 +392,8 @@ impl RegionMetaMap {
         // other region, but because we use region_id as the unique identifier, we do
         // not load it for implementation simplicity as this kind of scenario
         // should be very rare.
-        if let Some(r) = self.regions.get(&region.id) {
-            return Some((r.state, r.region.epoch_version == region.epoch_version));
+        if let Some(region) = self.regions.get(&region.id) {
+            return Some(region.state);
         }
 
         None
@@ -451,17 +414,17 @@ impl RegionMetaMap {
         });
     }
 
-    pub fn cached_regions(&self) -> HashMap<u64, Arc<Mutex<CopRequestsSma>>> {
+    pub fn cached_regions(&self) -> Vec<u64> {
         self.regions
             .iter()
             .filter_map(|(id, meta)| {
                 if meta.state == RegionState::Active {
-                    Some((*id, meta.average_cop_requests.clone()))
+                    Some(*id)
                 } else {
                     None
                 }
             })
-            .collect::<HashMap<_, _>>()
+            .collect::<Vec<_>>()
     }
 
     pub fn iter_overlapped_regions(
@@ -863,25 +826,25 @@ impl RegionManager {
         &self,
         evict_region: &CacheRegion,
         evict_reason: EvictReason,
-        mut on_evict_finished: Option<OnEvictFinishedCallback>,
+        mut cb: Option<Box<dyn AsyncFnOnce + Send + Sync>>,
     ) -> Vec<CacheRegion> {
+        info!(
+            "ime try to evict region";
+            "evict_region" => ?evict_region,
+            "reason" => ?evict_reason,
+        );
+
         let mut regions_map = self.regions_map.write();
         let mut evict_ids = vec![];
         regions_map.on_all_overlapped_regions(evict_region, |meta| {
             evict_ids.push(meta.region.id);
         });
         if evict_ids.is_empty() {
-            debug!("ime evict a region that is not cached";
+            info!("ime evict a region that is not cached";
                 "reason" => ?evict_reason,
                 "region" => ?evict_region);
             return vec![];
         }
-
-        info!(
-            "ime try to evict region";
-            "evict_region" => ?evict_region,
-            "reason" => ?evict_reason,
-        );
 
         let mut deletable_regions = vec![];
         for rid in evict_ids {
@@ -891,7 +854,7 @@ impl RegionManager {
                 evict_reason,
                 &mut regions_map,
                 if rid == evict_region.id {
-                    on_evict_finished.take()
+                    cb.take()
                 } else {
                     None
                 },
@@ -909,7 +872,7 @@ impl RegionManager {
         evict_region: &CacheRegion,
         evict_reason: EvictReason,
         regions_map: &mut RegionMetaMap,
-        on_evict_finished: Option<OnEvictFinishedCallback>,
+        cb: Option<Box<dyn AsyncFnOnce + Send + Sync>>,
     ) -> Option<CacheRegion> {
         let meta = regions_map.mut_region_meta(id).unwrap();
         let prev_state = meta.state;
@@ -936,7 +899,7 @@ impl RegionManager {
         }
 
         if prev_state == RegionState::Active {
-            meta.mark_evict(RegionState::PendingEvict, evict_reason, on_evict_finished);
+            meta.mark_evict(RegionState::PendingEvict, evict_reason, cb);
         } else {
             meta.set_state(RegionState::LoadingCanceled)
         };
@@ -977,7 +940,7 @@ impl RegionManager {
                     evict_info.start.saturating_elapsed_secs(),
                     evict_info.reason,
                 );
-                if let Some(cb) = evict_info.on_evict_finished {
+                if let Some(cb) = evict_info.cb {
                     cbs.push(cb);
                 }
 
@@ -1013,9 +976,7 @@ impl RegionManager {
         }
     }
 
-    /// Return Ok if it initiates load successfully, otherwise return the failed
-    /// reason.
-    pub(crate) fn load_region(&self, cache_region: CacheRegion) -> Result<(), LoadFailedReason> {
+    pub fn load_region(&self, cache_region: CacheRegion) -> Result<(), LoadFailedReason> {
         self.regions_map.write().load_region(cache_region)
     }
 
@@ -1077,23 +1038,11 @@ impl RegionManager {
     }
 }
 
-/// The load failure reason, the bool value indicates whether the failure is
-/// caused by the same region.
 #[derive(Debug, PartialEq)]
 pub enum LoadFailedReason {
-    Overlapped(bool),
-    PendingRange(bool),
-    Evicting(bool),
-}
-
-impl LoadFailedReason {
-    pub fn is_caused_by_same_region(&self) -> bool {
-        match self {
-            LoadFailedReason::Evicting(same)
-            | LoadFailedReason::Overlapped(same)
-            | LoadFailedReason::PendingRange(same) => *same,
-        }
-    }
+    Overlapped,
+    PendingRange,
+    Evicting,
 }
 
 #[derive(PartialEq, Debug, Clone, Copy)]
@@ -1198,7 +1147,7 @@ mod tests {
     }
 
     #[test]
-    fn test_region_load() {
+    fn test_range_load() {
         let region_mgr = RegionManager::default();
         let r1 = CacheRegion::new(1, 0, b"k00", b"k10");
         let mut r2 = CacheRegion::new(2, 2, b"k10", b"k20");
@@ -1212,24 +1161,24 @@ mod tests {
 
         assert_eq!(
             region_mgr.load_region(r1).unwrap_err(),
-            LoadFailedReason::Evicting(true)
+            LoadFailedReason::Evicting
         );
 
         // load r2 with an outdated epoch.
         r2.epoch_version = 1;
         assert_eq!(
             region_mgr.load_region(r2).unwrap_err(),
-            LoadFailedReason::PendingRange(false),
+            LoadFailedReason::PendingRange,
         );
 
         assert_eq!(
             region_mgr.load_region(r4).unwrap_err(),
-            LoadFailedReason::Overlapped(false)
+            LoadFailedReason::Overlapped
         );
     }
 
     #[test]
-    fn test_region_load_overlapped() {
+    fn test_range_load_overlapped() {
         let region_mgr = RegionManager::default();
         let r1 = CacheRegion::new(1, 0, b"k00", b"k10");
         let r3 = CacheRegion::new(3, 0, b"k40", b"k50");
@@ -1241,30 +1190,30 @@ mod tests {
         let r = CacheRegion::new(4, 0, b"k00", b"k05");
         assert_eq!(
             region_mgr.load_region(r).unwrap_err(),
-            LoadFailedReason::Evicting(false)
+            LoadFailedReason::Evicting
         );
         let r = CacheRegion::new(4, 0, b"k05", b"k15");
         assert_eq!(
             region_mgr.load_region(r).unwrap_err(),
-            LoadFailedReason::Evicting(false)
+            LoadFailedReason::Evicting
         );
 
         let r = CacheRegion::new(4, 0, b"k35", b"k45");
         assert_eq!(
             region_mgr.load_region(r).unwrap_err(),
-            LoadFailedReason::PendingRange(false)
+            LoadFailedReason::PendingRange
         );
         let r = CacheRegion::new(4, 0, b"k45", b"k55");
         assert_eq!(
             region_mgr.load_region(r).unwrap_err(),
-            LoadFailedReason::PendingRange(false)
+            LoadFailedReason::PendingRange
         );
 
         // test range overlap but id overlap
         let r = CacheRegion::new(1, 2, b"k20", b"k30");
         assert_eq!(
             region_mgr.load_region(r).unwrap_err(),
-            LoadFailedReason::Evicting(false)
+            LoadFailedReason::Evicting
         );
     }
 
