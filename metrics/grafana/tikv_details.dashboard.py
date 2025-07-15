@@ -1971,6 +1971,80 @@ def RaftWaterfall() -> RowPanel:
     return layout.row_panel
 
 
+def RaftstoreIO() -> RowPanel:
+    layout = Layout(title="Raftstore IO")
+
+    def add_row(layout, label: str, desc: str):
+        title = label.replace("_", " ").capitalize()
+        layout.row(
+            heatmap_panel_graph_panel_histogram_quantile_pairs(
+                heatmap_title=f"{title}",
+                heatmap_description=f"{desc}",
+                graph_title=f"99% {title}",
+                graph_description=f"{desc}",
+                graph_by_labels=["instance"],
+                graph_hides=["count", "avg"],
+                yaxis_format=UNITS.SECONDS,
+                metric="tikv_raftstore_io_duration_seconds",
+                label_selectors=[f'reason="{label}"'],
+            )
+        )
+
+    for lb, desc in [
+        (
+            "peer_destroy_kv_write",
+            "The time taken by Raftstore to complete RocksDB write operation when destroying a peer",
+        ),
+        (
+            "peer_destroy_raft_write",
+            "The time taken by Raftstore to complete RaftEngine write operation when destroying a peer",
+        ),
+        (
+            "init_raft_state",
+            "The time taken by Raftstore to complete initializing raft state when creating a peer",
+        ),
+        (
+            "init_apply_state",
+            "The time taken by Raftstore to complete initializing apply state when creating a peer",
+        ),
+        (
+            "entry_storage_create",
+            "The time taken by Raftstore to complete RaftEngine read operation when creating a peer",
+        ),
+        (
+            "store_check_msg",
+            "The time taken by Raftstore to check region state when TiKV receives an message to non-exist regions",
+        ),
+        (
+            "peer_check_merge_target_stale",
+            "The time taken by Raftstore to check stale merged regions",
+        ),
+        (
+            "peer_maybe_create",
+            "The time taken by Raftstore to complete RocksDB and RaftEngine read operation when creating a peer",
+        ),
+        (
+            "peer_snapshot_read",
+            "The time taken by Raftstore to complete a read requests",
+        ),
+        (
+            "v2_compatible_learner",
+            "The time taken by Raftstore to handle raftstore v2 compatibility checking",
+        ),
+        (
+            "raft_term",
+            "The time taken by Raftstore to get terms of raft logs by reading RaftEngine",
+        ),
+        (
+            "raft_fetch_log",
+            "The time taken by Raftstore to fetch raft logs by reading RaftEngine",
+        ),
+    ]:
+        add_row(layout, lb, desc)
+
+    return layout.row_panel
+
+
 def RaftIO() -> RowPanel:
     layout = Layout(title="Raft IO")
     layout.row(
@@ -3133,6 +3207,25 @@ def Storage() -> RowPanel:
             ),
         ]
     )
+    layout.row(
+        [
+            graph_panel(
+                title="Concurrency manager max-ts",
+                description="The max_ts in the concurrency manager",
+                yaxes=yaxes(left_format=UNITS.NONE_FORMAT),
+                targets=[
+                    target(
+                        expr="tikv_concurrency_manager_max_ts_limit",
+                        legend_format="max_ts_limit",
+                    ),
+                    target(
+                        expr="tikv_concurrency_manager_max_ts",
+                        legend_format="max_ts",
+                    ),
+                ],
+            )
+        ]
+    )
     return layout.row_panel
 
 
@@ -4071,6 +4164,15 @@ def Snapshot() -> RowPanel:
                         legend_format="clean-region-by-{{type}}",
                         additional_groupby=True,
                     ),
+                    target(
+                        expr=expr_sum_delta(
+                            "tikv_server_snapshot_task_total",
+                            range_selector="1m",
+                            by_labels=["type"],
+                        ),
+                        legend_format="{{type}}",
+                        additional_groupby=True,
+                    ),
                 ],
             ),
             graph_panel(
@@ -4082,13 +4184,14 @@ def Snapshot() -> RowPanel:
                         expr=expr_sum_rate(
                             "tikv_snapshot_limit_transport_bytes",
                             by_labels=["instance", "type"],
-                        ),
+                        )
                     ),
                     target(
                         expr=expr_sum_rate(
                             "tikv_snapshot_limit_generate_bytes",
+                            by_labels=["instance", "type"],
                         ),
-                        legend_format="{{instance}}-generate",
+                        legend_format="{{instance}}-generate-{{type}}",
                     ),
                 ],
             ),
@@ -4589,7 +4692,7 @@ def InMemoryEngine() -> RowPanel:
                             "tikv_in_memory_engine_cache_count",
                             by_labels=["instance", "type"],
                         ),
-                        legend_format="{{instance}}--{{type}}",
+                        legend_format="{{instance}}-{{type}}",
                     ),
                 ],
             ),
@@ -4659,6 +4762,25 @@ def InMemoryEngine() -> RowPanel:
                     target(
                         expr=expr_sum_delta(
                             "tikv_in_memory_engine_eviction_duration_secs_count",
+                            by_labels=["type"],
+                        ),
+                        legend_format="{{type}}",
+                        additional_groupby=True,
+                    ),
+                ],
+            ),
+        ]
+    )
+    layout.row(
+        [
+            graph_panel(
+                title="Region Warmup Count",
+                description="The count of region warmup per seconds",
+                yaxes=yaxes(left_format=UNITS.OPS_PER_SEC),
+                targets=[
+                    target(
+                        expr=expr_sum_rate(
+                            "tikv_in_memory_engine_transfer_leader_warmup_total",
                             by_labels=["type"],
                         ),
                         legend_format="{{type}}",
@@ -4882,6 +5004,38 @@ def InMemoryEngine() -> RowPanel:
                         additional_groupby=True,
                     ),
                 ],
+            ),
+        ]
+    )
+    layout.row(
+        [
+            heatmap_panel(
+                title="Cached Region Coprocessor Requests",
+                description="Tthe number of coprocessor requests of cached regions that is observed during auto load and evict",
+                yaxis=yaxis(format=UNITS.SHORT),
+                metric="tikv_in_memory_engine_auto_load_evict_cached_region_coprocessor_requests_bucket",
+            ),
+            heatmap_panel(
+                title="Cached Region MVCC Amplification",
+                description="Tthe MVCC amplification of cached regions that is observed during auto load and evict",
+                yaxis=yaxis(format=UNITS.SHORT),
+                metric="tikv_in_memory_engine_auto_load_evict_cached_region_mvcc_amplification_bucket",
+            ),
+        ]
+    )
+    layout.row(
+        [
+            heatmap_panel(
+                title="Top Region Coprocessor Requests",
+                description="Tthe number of coprocessor requests of top regions that is observed during auto load and evict",
+                yaxis=yaxis(format=UNITS.SHORT),
+                metric="tikv_in_memory_engine_auto_load_evict_top_region_coprocessor_requests_bucket",
+            ),
+            heatmap_panel(
+                title="Top Region MVCC Amplification",
+                description="Tthe MVCC amplification of top regions that is observed during auto load and evict",
+                yaxis=yaxis(format=UNITS.SHORT),
+                metric="tikv_in_memory_engine_auto_load_evict_top_region_mvcc_amplification_bucket",
             ),
         ]
     )
@@ -6553,6 +6707,24 @@ def RocksDB() -> RowPanel:
                 metric="tikv_storage_ingest_external_file_duration_secs",
                 by_labels=["cf", "type"],
                 hide_count=True,
+            ),
+        ]
+    )
+    layout.row(
+        [
+            graph_panel(
+                title="Ingest SST allow_write",
+                description=None,
+                yaxes=yaxes(left_format=UNITS.SHORT),
+                targets=[
+                    target(
+                        expr=expr_sum_rate(
+                            "tikv_storage_ingest_external_file_allow_write_counter",
+                            by_labels=["type"],
+                        ),
+                        additional_groupby=True,
+                    ),
+                ],
             ),
         ]
     )
@@ -9997,6 +10169,7 @@ dashboard = Dashboard(
         IOBreakdown(),
         # Raftstore
         RaftWaterfall(),
+        RaftstoreIO(),
         RaftIO(),
         RaftPropose(),
         RaftProcess(),

@@ -1,6 +1,6 @@
 [package]
 name = "tikv"
-version = "8.5.0"
+version = "8.5.3"
 authors = ["The TiKV Authors"]
 description = "A distributed transactional key-value database powered by Rust and Raft"
 license = "Apache-2.0"
@@ -36,6 +36,7 @@ testexport = [
   "engine_rocks/testexport",
   "engine_panic/testexport",
   "encryption/testexport",
+  "file_system/testexport"
 ]
 test-engine-kv-rocksdb = ["engine_test/test-engine-kv-rocksdb"]
 test-engine-raft-raft-engine = ["engine_test/test-engine-raft-raft-engine"]
@@ -131,7 +132,7 @@ paste = "1.0"
 pd_client = { workspace = true }
 pin-project = "1.0"
 pnet_datalink = "0.23"
-pprof = { version = "0.14", default-features = false, features = [
+pprof = { version = "0.15", default-features = false, features = [
   "flamegraph",
   "protobuf-codec",
 ] }
@@ -416,10 +417,10 @@ txn_types = { path = "components/txn_types" }
 raft = { version = "0.7.0", default-features = false, features = [
   "protobuf-codec",
 ] }
-raft-engine = { git = "https://github.com/tikv/raft-engine.git", features = [
+raft-engine = { git = "https://github.com/tikv/raft-engine.git", branch = "tikv-8.5", features = [
   "swap",
 ] }
-raft-engine-ctl = { git = "https://github.com/tikv/raft-engine.git" }
+raft-engine-ctl = { git = "https://github.com/tikv/raft-engine.git", branch = "tikv-8.5" }
 grpcio = { version = "0.10.4", default-features = false, features = [
   "openssl",
   "protobuf-codec",

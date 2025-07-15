@@ -38,6 +38,7 @@ use tikv_kv::{Engine, LocalTablets, Modify, WriteData};
 use tikv_util::{
     config::ReadableSize,
     future::{create_stream_with_buffer, paired_future_callback},
+    resizable_threadpool::{DeamonRuntimeHandle, ResizableRuntime},
     sys::{
         disk::{get_disk_status, DiskUsage},
         thread::ThreadBuildWrapper,
@@ -45,7 +46,7 @@ use tikv_util::{
     time::{Instant, Limiter},
     HandyRwLock,
 };
-use tokio::{runtime::Runtime, time::sleep};
+use tokio::time::sleep;
 use txn_types::{Key, WriteRef, WriteType};
 
 use super::{
@@ -120,10 +121,14 @@ pub struct ImportSstService<E: Engine> {
     cfg: ConfigManager,
     tablets: LocalTablets<E::Local>,
     engine: E,
-    threads: Arc<Runtime>,
+    threads: DeamonRuntimeHandle,
+    // threads_ref is for safely cleanning
+    #[allow(dead_code)]
+    threads_ref: Arc<Mutex<ResizableRuntime>>,
     importer: Arc<SstImporter<E::Local>>,
     limiter: Limiter,
     ingest_latch: Arc<IngestLatch>,
+    ingest_admission_guard: Arc<Mutex<()>>,
     raft_entry_max_size: ReadableSize,
     region_info_accessor: Arc<RegionInfoAccessor>,
 
@@ -322,51 +327,65 @@ impl<E: Engine> ImportSstService<E> {
         resource_manager: Option<Arc<ResourceGroupManager>>,
         region_info_accessor: Arc<RegionInfoAccessor>,
     ) -> Self {
-        let props = tikv_util::thread_group::current_properties();
-        let eng = Mutex::new(engine.clone());
-        let threads = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(cfg.num_threads)
-            .enable_all()
-            .thread_name("sst-importer")
-            .with_sys_and_custom_hooks(
-                move || {
-                    tikv_util::thread_group::set_properties(props.clone());
+        let eng = Arc::new(Mutex::new(engine.clone()));
+        let create_tokio_runtime = move |thread_count: usize, thread_name: &str| {
+            let props = tikv_util::thread_group::current_properties();
+            let eng = eng.clone();
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(thread_count)
+                .enable_all()
+                .thread_name(thread_name)
+                .with_sys_and_custom_hooks(
+                    move || {
+                        tikv_util::thread_group::set_properties(props.clone());
+                        set_io_type(IoType::Import);
+                        tikv_kv::set_tls_engine(eng.lock().unwrap().clone());
+                    },
+                    move || {
+                        // SAFETY: we have set the engine at some lines above with type `E`.
+                        unsafe { tikv_kv::destroy_tls_engine::<E>() };
+                    },
+                )
+                .build()
+        };
 
-                    set_io_type(IoType::Import);
-                    tikv_kv::set_tls_engine(eng.lock().unwrap().clone());
-                },
-                move || {
-                    // SAFETY: we have set the engine at some lines above with type `E`.
-                    unsafe { tikv_kv::destroy_tls_engine::<E>() };
-                },
-            )
-            .build()
-            .unwrap();
+        let threads = ResizableRuntime::new(
+            4,
+            "impwkr",
+            Box::new(create_tokio_runtime),
+            Box::new(|_| ()),
+        );
+
+        let handle = threads.handle();
+        let threads_clone = Arc::new(Mutex::new(threads));
         if let LocalTablets::Singleton(tablet) = &tablets {
-            importer.start_switch_mode_check(threads.handle(), Some(tablet.clone()));
+            importer.start_switch_mode_check(&handle.clone(), Some(tablet.clone()));
         } else {
-            importer.start_switch_mode_check(threads.handle(), None);
+            importer.start_switch_mode_check(&handle.clone(), None);
         }
-
         let writer = raft_writer::ThrottledTlsEngineWriter::default();
         let gc_handle = writer.clone();
-        threads.spawn(async move {
+        handle.spawn(async move {
             while gc_handle.try_gc() {
                 tokio::time::sleep(WRITER_GC_INTERVAL).await;
             }
         });
-
-        let cfg_mgr = ConfigManager::new(cfg);
-        threads.spawn(Self::tick(importer.clone(), cfg_mgr.clone()));
+        let num_threads = cfg.num_threads;
+        let cfg_mgr = ConfigManager::new(cfg, Arc::downgrade(&threads_clone));
+        handle.spawn(Self::tick(importer.clone(), cfg_mgr.clone()));
+        // Drop the initial pool to accept new tasks
+        threads_clone.lock().unwrap().adjust_with(num_threads);
 
         ImportSstService {
             cfg: cfg_mgr,
             tablets,
-            threads: Arc::new(threads),
+            threads: handle.clone(),
+            threads_ref: threads_clone,
             engine,
             importer,
             limiter: Limiter::new(f64::INFINITY),
             ingest_latch: Arc::default(),
+            ingest_admission_guard: Arc::default(),
             raft_entry_max_size,
             region_info_accessor,
             writer,
@@ -672,62 +691,69 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
     // future.
     fn switch_mode(
         &mut self,
-        ctx: RpcContext<'_>,
+        _ctx: RpcContext<'_>,
         mut req: SwitchModeRequest,
         sink: UnarySink<SwitchModeResponse>,
     ) {
         let label = "switch_mode";
         IMPORT_RPC_COUNT.with_label_values(&[label]).inc();
         let timer = Instant::now_coarse();
+        let importer = self.importer.clone();
+        let tablets = self.tablets.clone();
 
-        let res = {
-            fn mf(cf: &str, name: &str, v: f64) {
-                CONFIG_ROCKSDB_GAUGE.with_label_values(&[cf, name]).set(v);
-            }
+        let task = async move {
+            let req_mode = req.get_mode();
+            let handle = tokio::task::spawn_blocking(move || {
+                fn mf(cf: &str, name: &str, v: f64) {
+                    CONFIG_ROCKSDB_GAUGE.with_label_values(&[cf, name]).set(v);
+                }
 
-            match &self.tablets {
-                LocalTablets::Singleton(tablet) => match req.get_mode() {
-                    SwitchMode::Normal => self.importer.enter_normal_mode(tablet.clone(), mf),
-                    SwitchMode::Import => self.importer.enter_import_mode(tablet.clone(), mf),
-                },
-                LocalTablets::Registry(_) => {
-                    if req.get_mode() == SwitchMode::Import {
-                        if !req.get_ranges().is_empty() {
-                            let ranges = req.take_ranges().to_vec();
-                            self.importer.ranges_enter_import_mode(ranges);
-                            Ok(true)
+                match tablets {
+                    LocalTablets::Singleton(tablet) => match req.get_mode() {
+                        SwitchMode::Normal => importer.enter_normal_mode(tablet, mf),
+                        SwitchMode::Import => importer.enter_import_mode(tablet, mf),
+                    },
+                    LocalTablets::Registry(_) => {
+                        if req.get_mode() == SwitchMode::Import {
+                            if !req.get_ranges().is_empty() {
+                                let ranges = req.take_ranges().to_vec();
+                                importer.ranges_enter_import_mode(ranges);
+                                Ok(true)
+                            } else {
+                                Err(sst_importer::Error::Engine(
+                                    "partitioned-raft-kv only support switch mode with range set"
+                                        .into(),
+                                ))
+                            }
                         } else {
-                            Err(sst_importer::Error::Engine(
-                                "partitioned-raft-kv only support switch mode with range set"
-                                    .into(),
-                            ))
-                        }
-                    } else {
-                        // case SwitchMode::Normal
-                        if !req.get_ranges().is_empty() {
-                            let ranges = req.take_ranges().to_vec();
-                            self.importer.clear_import_mode_regions(ranges);
-                            Ok(true)
-                        } else {
-                            Err(sst_importer::Error::Engine(
-                                "partitioned-raft-kv only support switch mode with range set"
-                                    .into(),
-                            ))
+                            // case SwitchMode::Normal
+                            if !req.get_ranges().is_empty() {
+                                let ranges = req.take_ranges().to_vec();
+                                importer.clear_import_mode_regions(ranges);
+                                Ok(true)
+                            } else {
+                                Err(sst_importer::Error::Engine(
+                                    "partitioned-raft-kv only support switch mode with range set"
+                                        .into(),
+                                ))
+                            }
                         }
                     }
                 }
+            });
+            match handle.await.map_err(|e| Error::Io(e.into())) {
+                Ok(res) => match res {
+                    Ok(_) => info!("switch mode"; "mode" => ?req_mode),
+                    Err(ref e) => error!(%*e; "switch mode failed"; "mode" => ?req_mode,),
+                },
+                Err(ref e) => {
+                    error!(%*e; "joining the background job failed"; "mode" => ?req_mode,)
+                }
             }
-        };
-        match res {
-            Ok(_) => info!("switch mode"; "mode" => ?req.get_mode()),
-            Err(ref e) => error!(%*e; "switch mode failed"; "mode" => ?req.get_mode(),),
-        }
-
-        let task = async move {
             defer! { IMPORT_RPC_COUNT.with_label_values(&[label]).dec() }
             crate::send_rpc_response!(Ok(SwitchModeResponse::default()), sink, label, timer);
         };
-        ctx.spawn(task);
+        self.threads.spawn(task);
     }
 
     /// Receive SST from client and save the file for later ingesting.
@@ -959,6 +985,7 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
         let tablets = self.tablets.clone();
         let store_meta = self.store_meta.clone();
         let ingest_latch = self.ingest_latch.clone();
+        let ingest_admission_guard = self.ingest_admission_guard.clone();
 
         let handle_task = async move {
             defer! { IMPORT_RPC_COUNT.with_label_values(&[label]).dec() }
@@ -973,6 +1000,7 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
                 &store_meta,
                 &import,
                 &ingest_latch,
+                &ingest_admission_guard,
                 label,
             )
             .await;
@@ -997,6 +1025,7 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
         let tablets = self.tablets.clone();
         let store_meta = self.store_meta.clone();
         let ingest_latch = self.ingest_latch.clone();
+        let ingest_admission_guard = self.ingest_admission_guard.clone();
 
         let handle_task = async move {
             defer! { IMPORT_RPC_COUNT.with_label_values(&[label]).dec() }
@@ -1008,6 +1037,7 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
                 &store_meta,
                 &import,
                 &ingest_latch,
+                &ingest_admission_guard,
                 label,
             )
             .await;

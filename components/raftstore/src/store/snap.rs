@@ -899,9 +899,21 @@ impl Snapshot {
                         .get_actual_max_per_file_size(allow_multi_files_snapshot),
                     &self.mgr.limiter,
                     self.mgr.encryption_key_manager.clone(),
+                    for_balance,
                 )?
             };
-            SNAPSHOT_LIMIT_GENERATE_BYTES.inc_by(cf_stat.total_size as u64);
+            SNAPSHOT_LIMIT_GENERATE_BYTES_VEC
+                .kv
+                .inc_by(cf_stat.total_kv_size as u64);
+            SNAPSHOT_LIMIT_GENERATE_BYTES_VEC
+                .sst
+                .inc_by(cf_stat.total_sst_size as u64);
+            SNAPSHOT_LIMIT_GENERATE_BYTES_VEC
+                .plain
+                .inc_by(cf_stat.total_plain_size as u64);
+            SNAPSHOT_LIMIT_GENERATE_BYTES_VEC
+                .io
+                .inc_by(cf_stat.total_io_size as u64);
             cf_file.kv_count = cf_stat.key_count as u64;
             if cf_file.kv_count > 0 {
                 // Use `kv_count` instead of file size to check empty files because encrypted
@@ -924,14 +936,16 @@ impl Snapshot {
                 .observe(cf_stat.key_count as f64);
             SNAPSHOT_CF_SIZE
                 .get(*cf_enum)
-                .observe(cf_stat.total_size as f64);
+                .observe(cf_stat.total_kv_size as f64);
             info!(
                 "scan snapshot of one cf";
                 "region_id" => region.get_id(),
                 "snapshot" => self.path(),
                 "cf" => cf,
                 "key_count" => cf_stat.key_count,
-                "size" => cf_stat.total_size,
+                "size" => cf_stat.total_kv_size,
+                "sst_size" => cf_stat.total_sst_size,
+                "plain_size" => cf_stat.total_plain_size,
             );
         }
 
@@ -1183,7 +1197,13 @@ impl Snapshot {
                     )?;
                 } else {
                     // Apply the snapshot by ingest.
-                    snap_io::apply_sst_cf_files_by_ingest(clone_files.as_slice(), &options.db, cf)?;
+                    snap_io::apply_sst_cf_files_by_ingest(
+                        clone_files.as_slice(),
+                        &options.db,
+                        cf,
+                        enc_start_key(&region),
+                        enc_end_key(&region),
+                    )?;
                     coprocessor_host.post_apply_sst_from_snapshot(&region, cf, path);
                 }
             }
@@ -1459,17 +1479,18 @@ struct SnapManagerCore {
     max_per_file_size: Arc<AtomicU64>,
     enable_multi_snapshot_files: Arc<AtomicBool>,
     stats: Arc<Mutex<Vec<SnapshotStat>>>,
+    max_total_size: Arc<AtomicU64>,
     // Minimal column family size & kv counts for applying by ingest.
     min_ingest_cf_size: u64,
     min_ingest_cf_kvs: u64,
+    // Marker to represent the relative store is marked with Offline.
+    offlined: Arc<AtomicBool>,
 }
 
 /// `SnapManagerCore` trace all current processing snapshots.
 #[derive(Clone)]
 pub struct SnapManager {
     core: SnapManagerCore,
-    max_total_size: Arc<AtomicU64>,
-
     // only used to receive snapshot from v2
     tablet_snap_manager: Option<TabletSnapManager>,
 }
@@ -1753,11 +1774,13 @@ impl SnapManager {
     }
 
     pub fn max_total_snap_size(&self) -> u64 {
-        self.max_total_size.load(Ordering::Acquire)
+        self.core.max_total_size.load(Ordering::Acquire)
     }
 
     pub fn set_max_total_snap_size(&self, max_total_size: u64) {
-        self.max_total_size.store(max_total_size, Ordering::Release);
+        self.core
+            .max_total_size
+            .store(max_total_size, Ordering::Release);
     }
 
     pub fn set_max_per_file_size(&mut self, max_per_file_size: u64) {
@@ -1927,6 +1950,14 @@ impl SnapManager {
             .recv_concurrency_limiter
             .set_reserved_capacity(num_pending_applies)
     }
+
+    pub fn set_offline(&mut self, state: bool) {
+        self.core.offlined.store(state, Ordering::Release);
+    }
+
+    pub fn is_offlined(&self) -> bool {
+        self.core.offlined.load(Ordering::Acquire)
+    }
 }
 
 impl SnapManagerCore {
@@ -2024,6 +2055,7 @@ impl SnapManagerCore {
     }
 
     pub fn can_apply_cf_without_ingest(&self, cf_size: u64, cf_kvs: u64) -> bool {
+        fail_point!("apply_cf_without_ingest_false", |_| { false });
         if self.min_ingest_cf_size == 0 {
             return false;
         }
@@ -2219,11 +2251,12 @@ impl SnapManagerBuilder {
                 enable_multi_snapshot_files: Arc::new(AtomicBool::new(
                     self.enable_multi_snapshot_files,
                 )),
+                max_total_size: Arc::new(AtomicU64::new(max_total_size)),
                 stats: Default::default(),
                 min_ingest_cf_size: self.min_ingest_snapshot_size,
                 min_ingest_cf_kvs: self.min_ingest_snapshot_kvs,
+                offlined: Arc::new(AtomicBool::new(false)),
             },
-            max_total_size: Arc::new(AtomicU64::new(max_total_size)),
             tablet_snap_manager,
         };
         snapshot.set_max_per_file_size(self.max_per_file_size); // set actual max_per_file_size
@@ -2596,13 +2629,25 @@ pub mod tests {
     where
         E: KvEngine + KvEngineConstructorExt,
     {
+        open_test_db_with_nkeys(path, db_opt, cf_opts, 100)
+    }
+
+    pub fn open_test_db_with_nkeys<E>(
+        path: &Path,
+        db_opt: Option<DbOptions>,
+        cf_opts: Option<Vec<(&'static str, CfOptions)>>,
+        nkeys: u64,
+    ) -> Result<E>
+    where
+        E: KvEngine + KvEngineConstructorExt,
+    {
         let db = open_test_empty_db::<E>(path, db_opt, cf_opts).unwrap();
         // write some data into each cf
         for (i, cf) in db.cf_names().into_iter().enumerate() {
             let mut p = Peer::default();
             p.set_store_id(TEST_STORE_ID);
             p.set_id((i + 1) as u64);
-            for k in 0..100 {
+            for k in 0..nkeys {
                 let key = keys::data_key(format!("akey{}", k).as_bytes());
                 db.put_msg_cf(cf, &key[..], &p)?;
             }
@@ -2708,9 +2753,11 @@ pub mod tests {
             encryption_key_manager: None,
             max_per_file_size: Arc::new(AtomicU64::new(max_per_file_size)),
             enable_multi_snapshot_files: Arc::new(AtomicBool::new(true)),
+            max_total_size: Arc::new(AtomicU64::new(u64::MAX)),
             stats: Default::default(),
             min_ingest_cf_size: 0,
             min_ingest_cf_kvs: 0,
+            offlined: Arc::new(AtomicBool::new(false)),
         }
     }
 
