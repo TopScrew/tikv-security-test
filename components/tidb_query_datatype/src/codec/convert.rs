@@ -574,13 +574,13 @@ pub fn bytes_to_int_without_context(bytes: &[u8]) -> Result<i64> {
     if let Some(&c) = trimed.next() {
         if c == b'-' {
             negative = true;
-        } else if c.is_ascii_digit() {
+        } else if (b'0'..=b'9').contains(&c) {
             r = Some(i64::from(c) - i64::from(b'0'));
         } else if c != b'+' {
             return Ok(0);
         }
 
-        for c in trimed.take_while(|&c| c.is_ascii_digit()) {
+        for c in trimed.take_while(|&c| (b'0'..=b'9').contains(c)) {
             let cur = i64::from(*c - b'0');
             r = r.and_then(|r| r.checked_mul(10)).and_then(|r| {
                 if negative {
@@ -605,13 +605,13 @@ pub fn bytes_to_uint_without_context(bytes: &[u8]) -> Result<u64> {
     let mut trimed = bytes.iter().skip_while(|&&b| b == b' ' || b == b'\t');
     let mut r = Some(0u64);
     if let Some(&c) = trimed.next() {
-        if c.is_ascii_digit() {
+        if (b'0'..=b'9').contains(&c) {
             r = Some(u64::from(c) - u64::from(b'0'));
         } else if c != b'+' {
             return Ok(0);
         }
 
-        for c in trimed.take_while(|&c| c.is_ascii_digit()) {
+        for c in trimed.take_while(|&c| (b'0'..=b'9').contains(c)) {
             r = r
                 .and_then(|r| r.checked_mul(10))
                 .and_then(|r| r.checked_add(u64::from(*c - b'0')));
@@ -713,7 +713,7 @@ pub fn produce_str_with_specified_tp<'a>(
         return Ok(s);
     }
     let flen = flen as usize;
-    // flen is the char length, not byte length, for UTF8 and GBK/GB18030 charset,
+    // flen is the char length, not byte length, for UTF8 and GBK charset,
     // we need to calculate the char count and truncate to flen chars if it is
     // too long.
     if MULTI_BYTES_CHARSETS.contains(chs) {
@@ -857,7 +857,7 @@ pub fn get_valid_int_prefix_helper<'a>(
             if (c == '+' || c == '-') && i == 0 {
                 continue;
             }
-            if c.is_ascii_digit() {
+            if ('0'..='9').contains(&c) {
                 valid_len = i + 1;
                 continue;
             }
@@ -918,7 +918,7 @@ pub fn get_valid_float_prefix_helper<'a>(
                     break;
                 }
                 e_idx = i
-            } else if !c.is_ascii_digit() {
+            } else if !('0'..='9').contains(&c) {
                 break;
             } else {
                 saw_digit = true;
@@ -2222,19 +2222,13 @@ mod tests {
             ("世界，中国", 4, charset::CHARSET_ASCII),
             ("世界，中国", 5, charset::CHARSET_ASCII),
             ("世界，中国", 6, charset::CHARSET_ASCII),
-            // GBK/GB18030
+            // GBK
             ("世界，中国", 1, charset::CHARSET_GBK),
             ("世界，中国", 2, charset::CHARSET_GBK),
             ("世界，中国", 3, charset::CHARSET_GBK),
             ("世界，中国", 4, charset::CHARSET_GBK),
             ("世界，中国", 5, charset::CHARSET_GBK),
             ("世界，中国", 6, charset::CHARSET_GBK),
-            ("世界，中国", 1, charset::CHARSET_GB18030),
-            ("世界，中国", 2, charset::CHARSET_GB18030),
-            ("世界，中国", 3, charset::CHARSET_GB18030),
-            ("世界，中国", 4, charset::CHARSET_GB18030),
-            ("世界，中国", 5, charset::CHARSET_GB18030),
-            ("世界，中国", 6, charset::CHARSET_GB18030),
         ];
 
         let cfg = EvalConfig::from_flag(Flag::TRUNCATE_AS_WARNING);

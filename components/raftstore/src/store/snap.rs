@@ -11,14 +11,12 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, RwLock,
     },
-    thread,
-    time::{self, Duration},
-    u64,
+    thread, time, u64,
 };
 
 use collections::{HashMap, HashMapEntry as Entry};
-use encryption::{create_aes_ctr_crypter, DataKeyManager, Iv};
-use engine_traits::{CfName, KvEngine, CF_DEFAULT, CF_LOCK, CF_WRITE};
+use encryption::{create_aes_ctr_crypter, from_engine_encryption_method, DataKeyManager, Iv};
+use engine_traits::{CfName, EncryptionKeyManager, KvEngine, CF_DEFAULT, CF_LOCK, CF_WRITE};
 use error_code::{self, ErrorCode, ErrorCodeExt};
 use fail::fail_point;
 use file_system::{
@@ -77,14 +75,6 @@ const META_FILE_SUFFIX: &str = ".meta";
 
 const DELETE_RETRY_MAX_TIMES: u32 = 6;
 const DELETE_RETRY_TIME_MILLIS: u64 = 500;
-
-// TTL for the recv snap concurrency limiter, specified in seconds. This TTL
-// should be longer than the typical snapshot generation and transmission time.
-// If the TTL is too short, the limiter might permit more snapshots than
-// expected to be sent, leading to the receiver dropping them and the sender
-// regenerating them, which is what the concurrency limiter is designed to
-// prevent.
-const RECV_SNAP_CONCURRENCY_LIMITER_TTL_SECS: u64 = 60;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -632,7 +622,7 @@ impl Snapshot {
 
                 if let Some(mgr) = &s.mgr.encryption_key_manager {
                     let enc_info = mgr.new_file(&file_paths[idx])?;
-                    let mthd = enc_info.method;
+                    let mthd = from_engine_encryption_method(enc_info.method);
                     if mthd != EncryptionMethod::Plaintext {
                         let file_for_recving = cf_file.file_for_recving.last_mut().unwrap();
                         file_for_recving.encrypter = Some(
@@ -899,21 +889,9 @@ impl Snapshot {
                         .get_actual_max_per_file_size(allow_multi_files_snapshot),
                     &self.mgr.limiter,
                     self.mgr.encryption_key_manager.clone(),
-                    for_balance,
                 )?
             };
-            SNAPSHOT_LIMIT_GENERATE_BYTES_VEC
-                .kv
-                .inc_by(cf_stat.total_kv_size as u64);
-            SNAPSHOT_LIMIT_GENERATE_BYTES_VEC
-                .sst
-                .inc_by(cf_stat.total_sst_size as u64);
-            SNAPSHOT_LIMIT_GENERATE_BYTES_VEC
-                .plain
-                .inc_by(cf_stat.total_plain_size as u64);
-            SNAPSHOT_LIMIT_GENERATE_BYTES_VEC
-                .io
-                .inc_by(cf_stat.total_io_size as u64);
+            SNAPSHOT_LIMIT_GENERATE_BYTES.inc_by(cf_stat.total_size as u64);
             cf_file.kv_count = cf_stat.key_count as u64;
             if cf_file.kv_count > 0 {
                 // Use `kv_count` instead of file size to check empty files because encrypted
@@ -936,16 +914,14 @@ impl Snapshot {
                 .observe(cf_stat.key_count as f64);
             SNAPSHOT_CF_SIZE
                 .get(*cf_enum)
-                .observe(cf_stat.total_kv_size as f64);
+                .observe(cf_stat.total_size as f64);
             info!(
                 "scan snapshot of one cf";
                 "region_id" => region.get_id(),
                 "snapshot" => self.path(),
                 "cf" => cf,
                 "key_count" => cf_stat.key_count,
-                "size" => cf_stat.total_kv_size,
-                "sst_size" => cf_stat.total_sst_size,
-                "plain_size" => cf_stat.total_plain_size,
+                "size" => cf_stat.total_size,
             );
         }
 
@@ -1178,6 +1154,7 @@ impl Snapshot {
                     &mut cb,
                 )?;
             } else {
+                let _timer = INGEST_SST_DURATION_SECONDS.start_coarse_timer();
                 let path = cf_file.path.to_str().unwrap(); // path is not used at all
                 let clone_file_paths = cf_file.clone_file_paths();
                 let clone_files = clone_file_paths
@@ -1373,7 +1350,7 @@ impl Write for Snapshot {
             }
 
             assert!(cf_file.size[self.cf_file_index] != 0);
-            let file_for_recving = cf_file
+            let mut file_for_recving = cf_file
                 .file_for_recving
                 .get_mut(self.cf_file_index)
                 .unwrap();
@@ -1473,26 +1450,33 @@ struct SnapManagerCore {
 
     registry: Arc<RwLock<HashMap<SnapKey, Vec<SnapEntry>>>>,
     limiter: Limiter,
-    recv_concurrency_limiter: Arc<SnapRecvConcurrencyLimiter>,
     temp_sst_id: Arc<AtomicU64>,
     encryption_key_manager: Option<Arc<DataKeyManager>>,
     max_per_file_size: Arc<AtomicU64>,
     enable_multi_snapshot_files: Arc<AtomicBool>,
     stats: Arc<Mutex<Vec<SnapshotStat>>>,
-    max_total_size: Arc<AtomicU64>,
     // Minimal column family size & kv counts for applying by ingest.
     min_ingest_cf_size: u64,
     min_ingest_cf_kvs: u64,
+    max_total_size: Arc<AtomicU64>,
     // Marker to represent the relative store is marked with Offline.
     offlined: Arc<AtomicBool>,
 }
 
 /// `SnapManagerCore` trace all current processing snapshots.
-#[derive(Clone)]
 pub struct SnapManager {
     core: SnapManagerCore,
     // only used to receive snapshot from v2
     tablet_snap_manager: Option<TabletSnapManager>,
+}
+
+impl Clone for SnapManager {
+    fn clone(&self) -> Self {
+        SnapManager {
+            core: self.core.clone(),
+            tablet_snap_manager: self.tablet_snap_manager.clone(),
+        }
+    }
 }
 
 impl SnapManager {
@@ -1814,10 +1798,6 @@ impl SnapManager {
         self.core.limiter.speed_limit()
     }
 
-    pub fn set_concurrent_recv_snap_limit(&self, limit: usize) {
-        self.core.recv_concurrency_limiter.set_limit(limit);
-    }
-
     pub fn set_min_ingest_cf_limit(&mut self, bytes: ReadableSize) {
         self.core.min_ingest_cf_size = bytes.0;
         self.core.min_ingest_cf_kvs = std::cmp::max(10000, (bytes.as_mb_f64() * 10000.0) as u64);
@@ -1923,32 +1903,6 @@ impl SnapManager {
 
     pub fn limiter(&self) -> &Limiter {
         &self.core.limiter
-    }
-
-    /// recv_snap_precheck is part of the snapshot recv precheck process, which
-    /// aims to reduce unnecessary snapshot drops and regenerations. When a
-    /// leader wants to generate a snapshot for a follower, it first sends a
-    /// precheck message. Upon receiving the message, the follower uses this
-    /// function to consult the concurrency limiter, determining if it can
-    /// receive a new snapshot. If the precheck is successful, the leader will
-    /// proceed to generate and send the snapshot.
-    pub fn recv_snap_precheck(&self, region_id: u64) -> bool {
-        self.core.recv_concurrency_limiter.try_recv(region_id)
-    }
-
-    /// recv_snap_complete is part of the snapshot recv precheck process, and
-    /// should be called when a follower finishes receiving a snapshot.
-    pub fn recv_snap_complete(&self, region_id: u64) {
-        self.core.recv_concurrency_limiter.finish_recv(region_id)
-    }
-
-    /// Adjusts the capacity of the snapshot receive concurrency limiter to
-    /// account for the number of pending applies. This prevents more snapshots
-    /// to be generated if there are too many snapshots waiting to be applied.
-    pub fn set_pending_apply_count(&self, num_pending_applies: usize) {
-        self.core
-            .recv_concurrency_limiter
-            .set_reserved_capacity(num_pending_applies)
     }
 
     pub fn set_offline(&mut self, state: bool) {
@@ -2066,100 +2020,6 @@ impl SnapManagerCore {
     }
 }
 
-/// `SnapRecvConcurrencyLimiter` enforces a limit on the number of simultaneous
-/// snapshot receives. It is consulted before a snapshot is generated. It
-/// employs a TTL mechanism to automatically evict operations that have been
-/// pending longer than the specified TTL. The TTL helps to handle scenarios
-/// where a snapshot fails to be sent for any reason. Note that a limit of 0
-/// means there's no limit.
-#[derive(Clone)]
-pub struct SnapRecvConcurrencyLimiter {
-    limit: Arc<AtomicUsize>,
-    reserved_capacity: Arc<AtomicUsize>,
-    ttl_secs: u64,
-    timestamps: Arc<Mutex<HashMap<u64, Instant>>>,
-}
-
-impl SnapRecvConcurrencyLimiter {
-    // Note that a limit of 0 means there's no limit.
-    pub fn new(limit: usize, ttl_secs: u64) -> Self {
-        SnapRecvConcurrencyLimiter {
-            limit: Arc::new(AtomicUsize::new(limit)),
-            reserved_capacity: Arc::new(AtomicUsize::new(0)),
-            ttl_secs,
-            timestamps: Arc::new(Mutex::new(HashMap::with_capacity_and_hasher(
-                limit,
-                Default::default(),
-            ))),
-        }
-    }
-
-    // Attempts to add a snapshot receive operation if below the concurrency
-    // limit. Returns true if the operation is allowed, false otherwise.
-    pub fn try_recv(&self, region_id: u64) -> bool {
-        let mut timestamps = self.timestamps.lock().unwrap();
-        let current_time = Instant::now();
-        self.evict_expired_timestamps(&mut timestamps, current_time);
-
-        let limit = self.limit.load(Ordering::Relaxed);
-        if limit == 0 {
-            // 0 means no limit. In that case, we avoid inserting into the hash
-            // map to prevent it from growing indefinitely.
-            return true;
-        }
-
-        let reserved_capacity = self.reserved_capacity.load(Ordering::Relaxed);
-        // Insert into the map if its size is within limit. If the region id is
-        // already present in the map, update its timestamp.
-        if timestamps.len() + reserved_capacity < limit || timestamps.contains_key(&region_id) {
-            timestamps.insert(region_id, current_time);
-            return true;
-        }
-        false
-    }
-
-    fn evict_expired_timestamps(
-        &self,
-        timestamps: &mut HashMap<u64, Instant>,
-        current_time: Instant,
-    ) {
-        timestamps.retain(|region_id, timestamp| {
-            if current_time.duration_since(*timestamp) <= Duration::from_secs(self.ttl_secs) {
-                true
-            } else {
-                // This shouldn't happen if the TTL is set properly. When it
-                // does happen, the limiter may permit more snapshots than the
-                // configured limit to be sent and trigger the receiver busy
-                // error.
-                warn!(
-                    "region {} expired in the snap recv concurrency limiter",
-                    region_id
-                );
-                false
-            }
-        });
-        timestamps.shrink_to(self.limit.load(Ordering::Relaxed));
-    }
-
-    // Completes a snapshot receive operation by removing a timestamp from the
-    // queue.
-    pub fn finish_recv(&self, region_id: u64) {
-        self.timestamps.lock().unwrap().remove(&region_id);
-    }
-
-    pub fn set_limit(&self, limit: usize) {
-        self.limit.store(limit, Ordering::Relaxed);
-    }
-
-    // Set the reserved capacity of the limiter. The reserved capacity is
-    // unavailable for use. The actual available capacity is calculated as
-    // the total limit minus the reserved capacity.
-    pub fn set_reserved_capacity(&self, reserved_cap: usize) {
-        self.reserved_capacity
-            .store(reserved_cap, Ordering::Relaxed);
-    }
-}
-
 #[derive(Clone, Default)]
 pub struct SnapManagerBuilder {
     max_write_bytes_per_sec: i64,
@@ -2168,7 +2028,6 @@ pub struct SnapManagerBuilder {
     enable_multi_snapshot_files: bool,
     enable_receive_tablet_snapshot: bool,
     key_manager: Option<Arc<DataKeyManager>>,
-    concurrent_recv_snap_limit: usize,
     min_ingest_snapshot_size: u64,
     min_ingest_snapshot_kvs: u64,
 }
@@ -2184,13 +2043,6 @@ impl SnapManagerBuilder {
         self.max_total_size = bytes;
         self
     }
-
-    #[must_use]
-    pub fn concurrent_recv_snap_limit(mut self, limit: usize) -> SnapManagerBuilder {
-        self.concurrent_recv_snap_limit = limit;
-        self
-    }
-
     pub fn max_per_file_size(mut self, bytes: u64) -> SnapManagerBuilder {
         self.max_per_file_size = bytes;
         self
@@ -2241,10 +2093,6 @@ impl SnapManagerBuilder {
                 base: path,
                 registry: Default::default(),
                 limiter,
-                recv_concurrency_limiter: Arc::new(SnapRecvConcurrencyLimiter::new(
-                    self.concurrent_recv_snap_limit,
-                    RECV_SNAP_CONCURRENCY_LIMITER_TTL_SECS,
-                )),
                 temp_sst_id: Arc::new(AtomicU64::new(0)),
                 encryption_key_manager: self.key_manager,
                 max_per_file_size: Arc::new(AtomicU64::new(u64::MAX)),
@@ -2396,7 +2244,7 @@ impl TabletSnapManager {
             .stats
             .lock()
             .unwrap()
-            .extract_if(|_, (_, stat)| stat.get_region_id() > 0)
+            .drain_filter(|_, (_, stat)| stat.get_region_id() > 0)
             .map(|(_, (_, stat))| stat)
             .filter(|stat| stat.get_total_duration_sec() > 1)
             .collect();
@@ -2629,25 +2477,13 @@ pub mod tests {
     where
         E: KvEngine + KvEngineConstructorExt,
     {
-        open_test_db_with_nkeys(path, db_opt, cf_opts, 100)
-    }
-
-    pub fn open_test_db_with_nkeys<E>(
-        path: &Path,
-        db_opt: Option<DbOptions>,
-        cf_opts: Option<Vec<(&'static str, CfOptions)>>,
-        nkeys: u64,
-    ) -> Result<E>
-    where
-        E: KvEngine + KvEngineConstructorExt,
-    {
         let db = open_test_empty_db::<E>(path, db_opt, cf_opts).unwrap();
         // write some data into each cf
         for (i, cf) in db.cf_names().into_iter().enumerate() {
             let mut p = Peer::default();
             p.set_store_id(TEST_STORE_ID);
             p.set_id((i + 1) as u64);
-            for k in 0..nkeys {
+            for k in 0..100 {
                 let key = keys::data_key(format!("akey{}", k).as_bytes());
                 db.put_msg_cf(cf, &key[..], &p)?;
             }
@@ -2744,10 +2580,6 @@ pub mod tests {
         SnapManagerCore {
             base: path.to_owned(),
             registry: Default::default(),
-            recv_concurrency_limiter: Arc::new(SnapRecvConcurrencyLimiter::new(
-                0,
-                RECV_SNAP_CONCURRENCY_LIMITER_TTL_SECS,
-            )),
             limiter: Limiter::new(f64::INFINITY),
             temp_sst_id: Arc::new(AtomicU64::new(0)),
             encryption_key_manager: None,
@@ -3625,68 +3457,5 @@ pub mod tests {
         assert_eq!(expect_key, key);
         let path = snap_dir.path().join("gen_1_2_3_4.tmp");
         TabletSnapKey::from_path(path).unwrap_err();
-    }
-
-    #[test]
-    fn test_snap_recv_limiter() {
-        let ttl_secs = 60;
-
-        let limiter = SnapRecvConcurrencyLimiter::new(1, ttl_secs);
-        limiter.finish_recv(10); // calling finish_recv() on an empty limiter is fine.
-        assert!(limiter.try_recv(1)); // first recv should succeed
-
-        // limiter.try_recv(2) should fail because we've reached the limit. But
-        // calling limiter.try_recv(1) should succeed again due to idempotence.
-        assert!(!limiter.try_recv(2));
-        assert!(limiter.try_recv(1));
-
-        // After finish_recv(1) is called, try_recv(2) should succeed.
-        limiter.finish_recv(1);
-        assert!(limiter.try_recv(2));
-
-        // Dynamically change the limit to 2, which will allow one more receive.
-        limiter.set_limit(2);
-        assert!(limiter.try_recv(1));
-        assert!(!limiter.try_recv(3));
-
-        limiter.finish_recv(1);
-        limiter.finish_recv(2);
-        // If we reserve a capacity of 1, the limiter will only allow one receive.
-        limiter.set_reserved_capacity(1);
-        assert!(limiter.try_recv(1));
-        assert!(!limiter.try_recv(2));
-
-        // Test the evict_expired_timestamps function.
-        let t_now = Instant::now();
-        let mut timestamps = [
-            (1, t_now - Duration::from_secs(ttl_secs + 2)), // expired
-            (2, t_now - Duration::from_secs(ttl_secs + 1)), // expired
-            (3, t_now - Duration::from_secs(ttl_secs - 1)), // alive
-            (4, t_now),                                     // alive
-        ]
-        .iter()
-        .cloned()
-        .collect();
-
-        limiter.evict_expired_timestamps(&mut timestamps, t_now);
-        assert_eq!(timestamps.len(), 2);
-        assert!(timestamps.contains_key(&3));
-        assert!(timestamps.contains_key(&4));
-        // Test the expiring logic in try_recv(1) with a 0s TTL, which
-        // effectively means there's no limit.
-        let limiter = SnapRecvConcurrencyLimiter::new(1, 0);
-        assert!(limiter.try_recv(1));
-        assert!(limiter.try_recv(2));
-        assert!(limiter.try_recv(3));
-
-        // After canceling the limit, the capacity of the VecDeque should be 0.
-        limiter.set_limit(0);
-        assert!(limiter.try_recv(1));
-        assert!(limiter.timestamps.lock().unwrap().capacity() == 0);
-
-        // Test initializing a limiter with no limit.
-        let limiter = SnapRecvConcurrencyLimiter::new(0, 0);
-        assert!(limiter.try_recv(1));
-        assert!(limiter.timestamps.lock().unwrap().capacity() == 0);
     }
 }

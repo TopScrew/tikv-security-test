@@ -16,20 +16,14 @@ use std::{
 
 use bitflags::bitflags;
 use bytes::Bytes;
-use codec::{
-    buffer::BufferReader,
-    prelude::{NumberDecoder, NumberEncoder},
-};
 use collections::{HashMap, HashSet};
 use crossbeam::{atomic::AtomicCell, channel::TrySendError};
 use engine_traits::{
-    Engines, KvEngine, PerfContext, RaftEngine, Snapshot, WriteBatch, WriteOptions, CF_DEFAULT,
-    CF_LOCK, CF_WRITE,
+    Engines, KvEngine, PerfContext, RaftEngine, Snapshot, WriteBatch, WriteOptions, CF_LOCK,
 };
 use error_code::ErrorCodeExt;
 use fail::fail_point;
 use getset::{Getters, MutGetters};
-use keys::{enc_end_key, enc_start_key};
 use kvproto::{
     errorpb,
     kvrpcpb::{DiskFullOpt, ExtraOp as TxnExtraOp},
@@ -47,7 +41,7 @@ use kvproto::{
     },
 };
 use parking_lot::RwLockUpgradableReadGuard;
-use pd_client::{Feature, INVALID_ID};
+use pd_client::INVALID_ID;
 use protobuf::Message;
 use raft::{
     self,
@@ -59,10 +53,10 @@ use rand::seq::SliceRandom;
 use smallvec::SmallVec;
 use tikv_alloc::trace::TraceEvent;
 use tikv_util::{
-    box_err, box_try,
+    box_err,
     codec::number::decode_u64,
     debug, error, info,
-    store::{find_peer_by_id, is_learner},
+    store::is_learner,
     sys::disk::DiskUsage,
     time::{duration_to_sec, monotonic_raw_now, Instant as TiInstant, InstantExt},
     warn,
@@ -70,13 +64,13 @@ use tikv_util::{
     Either,
 };
 use time::{Duration as TimeDuration, Timespec};
-use tracker::{TrackerTokenArray, GLOBAL_TRACKERS};
+use tracker::GLOBAL_TRACKERS;
 use txn_types::{TimeStamp, WriteBatchFlags};
 use uuid::Uuid;
 
 use super::{
     cmd_resp,
-    local_metrics::{IoType, RaftMetrics},
+    local_metrics::RaftMetrics,
     metrics::*,
     peer_storage::{
         write_peer_state, CheckApplyingSnapStatus, HandleReadyResult, PeerStorage,
@@ -92,15 +86,11 @@ use super::{
     DestroyPeerJob, LocalReadContext,
 };
 use crate::{
-    coprocessor::{
-        split_observer::NO_VALID_SPLIT_KEY, CoprocessorHost, RegionChangeEvent, RegionChangeReason,
-        RoleChange, TransferLeaderCustomContext,
-    },
+    coprocessor::{CoprocessorHost, RegionChangeEvent, RegionChangeReason, RoleChange},
     errors::RAFTSTORE_IS_BUSY,
-    router::{RaftStoreRouter, ReadContext},
+    router::RaftStoreRouter,
     store::{
         async_io::{read::ReadTask, write::WriteMsg, write_router::WriteRouter},
-        entry_storage::CacheWarmupState,
         fsm::{
             apply::{self, CatchUpLogs},
             store::PollContext,
@@ -115,8 +105,8 @@ use crate::{
         unsafe_recovery::{ForceLeaderState, UnsafeRecoveryState},
         util::{admin_cmd_epoch_lookup, RegionReadProgress},
         worker::{
-            CleanupTask, CompactTask, HeartbeatTask, RaftlogGcTask, ReadDelegate, ReadExecutor,
-            ReadProgress, RegionTask, SplitCheckTask,
+            HeartbeatTask, RaftlogGcTask, ReadDelegate, ReadExecutor, ReadProgress, RegionTask,
+            SplitCheckTask,
         },
         Callback, Config, GlobalReplicationState, PdTask, PeerMsg, ReadCallback, ReadIndexContext,
         ReadResponse, TxnExt, WriteCallback, RAFT_INIT_LOG_INDEX,
@@ -128,9 +118,6 @@ const SHRINK_CACHE_CAPACITY: usize = 64;
 // 1s
 const MIN_BCAST_WAKE_UP_INTERVAL: u64 = 1_000;
 const REGION_READ_PROGRESS_CAP: usize = 128;
-
-const SNAP_GEN_PRECHECK_FEATURE: Feature = Feature::require(8, 2, 0);
-
 #[doc(hidden)]
 pub const MAX_COMMITTED_SIZE_PER_READY: u64 = 16 * 1024 * 1024;
 
@@ -569,7 +556,7 @@ pub fn can_amend_read<C>(
             if let Some(read) = last_pending_read {
                 let is_read_index_request = req
                     .get_requests()
-                    .first()
+                    .get(0)
                     .map(|req| req.has_read_index())
                     .unwrap_or_default();
                 // A read index request or a read with addition request always needs the
@@ -805,25 +792,6 @@ where
     pub pending_request_snapshot_count: Arc<AtomicUsize>,
     /// The index of last scheduled committed raft log.
     pub last_applying_idx: u64,
-    pub max_apply_unpersisted_log_limit: u64,
-    /// A flag used to track whether `max_apply_unpersisted_log_limit` is set
-    /// to the Peer in raft-rs. We need this flag to handle the metrics
-    /// `RAFT_ENABLE_UNPERSISTED_APPLY_GAUGE` correctly because raft-rs can
-    /// reset `max_apply_unpersisted_log_limit` to 0 when it demotes from
-    /// leader.
-    enable_apply_unpersisted_log_state: bool,
-    /// The minimum raft index after which apply unpersisted raft log can be
-    /// enabled. We force disable apply unpersisted raft log in following 2
-    /// situation:
-    /// 1) Raft term changes. In this case, the min index is set to the current
-    ///    last index. This is to let apply unpersisted log only happen within
-    ///    the same term so it's easier to if any applied but not persisted logs
-    ///    has changed in which case we should just panic to avoid data
-    ///    inconsistency.
-    /// 2) Propose PrepareMerge. In this case, the min index is set to that raft
-    ///    log's index. This is to make online unsafe recovery easier when
-    ///    region state is PrepareMerge.
-    pub min_safe_index_for_unpersisted_apply: u64,
     /// The index of last compacted raft log. It is used for the next compact
     /// log task.
     pub last_compacted_idx: u64,
@@ -923,10 +891,11 @@ where
     apply_snap_ctx: Option<ApplySnapshotContext>,
     /// region buckets info in this region.
     region_buckets_info: BucketStatsInfo,
+    /// lead_transferee if this peer(leader) is in a leadership transferring.
+    pub lead_transferee: u64,
     pub unsafe_recovery_state: Option<UnsafeRecoveryState>,
     pub snapshot_recovery_state: Option<SnapshotBrState>,
 
-    last_record_safe_point: u64,
     /// Used for checking whether the peer is busy on apply.
     /// * `None` => the peer has no pending logs for apply or already finishes
     ///   applying.
@@ -943,8 +912,6 @@ where
     /// leader, a campaign is triggered for those regions.
     /// Once the parent region has valid leader, this list will be cleared.
     pub uncampaigned_new_regions: Option<Vec<u64>>,
-
-    pub transfer_leader_state: TransferLeaderState,
 }
 
 impl<EK, ER> Peer<EK, ER>
@@ -955,7 +922,7 @@ where
     pub fn new(
         store_id: u64,
         cfg: &Config,
-        region_scheduler: Scheduler<RegionTask>,
+        region_scheduler: Scheduler<RegionTask<EK::Snapshot>>,
         raftlog_fetch_scheduler: Scheduler<ReadTask<EK>>,
         engines: Engines<EK, ER>,
         region: &metapb::Region,
@@ -996,9 +963,6 @@ where
             pre_vote: cfg.prevote,
             max_committed_size_per_ready: MAX_COMMITTED_SIZE_PER_READY,
             priority: if peer.is_witness { -1 } else { 0 },
-            // always disable applying unpersisted log at initialization,
-            // will enable it after applying to the current last_index.
-            max_apply_unpersisted_log_limit: 0,
             ..Default::default()
         };
 
@@ -1043,9 +1007,6 @@ where
             leader_missing_time: Some(Instant::now()),
             tag: tag.clone(),
             last_applying_idx: applied_index,
-            max_apply_unpersisted_log_limit: cfg.max_apply_unpersisted_log_limit,
-            enable_apply_unpersisted_log_state: false,
-            min_safe_index_for_unpersisted_apply: last_index,
             last_compacted_idx: 0,
             last_compacted_time: Instant::now(),
             has_pending_compact_cmd,
@@ -1085,7 +1046,6 @@ where
                 REGION_READ_PROGRESS_CAP,
                 peer_id,
             )),
-            last_record_safe_point: 0,
             memtrace_raft_entries: 0,
             write_router: WriteRouter::new(tag),
             unpersisted_readies: VecDeque::default(),
@@ -1094,7 +1054,7 @@ where
             persisted_number: 0,
             apply_snap_ctx: None,
             region_buckets_info: BucketStatsInfo::default(),
-            transfer_leader_state: TransferLeaderState::default(),
+            lead_transferee: raft::INVALID_ID,
             unsafe_recovery_state: None,
             snapshot_recovery_state: None,
             busy_on_apply: Some(false),
@@ -1209,51 +1169,6 @@ where
         match self.raft_group.raft.raft_log.term(idx) {
             Ok(t) => t,
             Err(e) => panic!("{} fail to load term for {}: {:?}", self.tag, idx, e),
-        }
-    }
-
-    #[inline]
-    pub fn maybe_update_apply_unpersisted_log_state(&mut self, applied_index: u64) {
-        if self.min_safe_index_for_unpersisted_apply > 0
-            && self.min_safe_index_for_unpersisted_apply <= applied_index
-        {
-            if self.max_apply_unpersisted_log_limit > 0
-                && self
-                    .raft_group
-                    .raft
-                    .raft_log
-                    .max_apply_unpersisted_log_limit
-                    == 0
-            {
-                RAFT_ENABLE_UNPERSISTED_APPLY_GAUGE.inc();
-                self.enable_apply_unpersisted_log_state = true;
-            }
-            self.raft_group
-                .raft
-                .set_max_apply_unpersisted_log_limit(self.max_apply_unpersisted_log_limit);
-            self.min_safe_index_for_unpersisted_apply = 0;
-        }
-    }
-
-    #[inline]
-    pub fn disable_apply_unpersisted_log(&mut self, min_enable_index: u64) {
-        self.min_safe_index_for_unpersisted_apply =
-            std::cmp::max(self.min_safe_index_for_unpersisted_apply, min_enable_index);
-        if self
-            .raft_group
-            .raft
-            .raft_log
-            .max_apply_unpersisted_log_limit
-            > 0
-        {
-            self.raft_group.raft.set_max_apply_unpersisted_log_limit(0);
-        }
-        // NOTE: `max_apply_unpersisted_log_limit` can be reset in raft-rs when leader
-        // demote to follower, in this case, we should still decrease the
-        // metrics counter.
-        if self.enable_apply_unpersisted_log_state {
-            self.enable_apply_unpersisted_log_state = false;
-            RAFT_ENABLE_UNPERSISTED_APPLY_GAUGE.dec();
         }
     }
 
@@ -1855,7 +1770,7 @@ where
                 "send raft msg";
                 "region_id" => self.region_id,
                 "peer_id" => self.peer.get_id(),
-                "msg_type" => %util::MsgType(&msg),
+                "msg_type" => ?msg_type,
                 "msg_size" => msg.get_message().compute_size(),
                 "to" => to_peer_id,
                 "disk_usage" => ?msg.get_disk_usage(),
@@ -1993,7 +1908,7 @@ where
         let has_snap_task = self.get_store().has_gen_snap_task();
         let pre_commit_index = self.raft_group.raft.raft_log.committed;
         self.raft_group.step(m)?;
-        self.report_commit_log_duration(pre_commit_index, &mut ctx.raft_metrics);
+        self.report_commit_log_duration(pre_commit_index, &ctx.raft_metrics);
 
         let mut for_balance = false;
         if !has_snap_task && self.get_store().has_gen_snap_task() {
@@ -2008,12 +1923,14 @@ where
             }
         }
         if for_balance {
-            self.get_store().set_gen_snap_task_for_balance();
+            if let Some(gen_task) = self.mut_store().mut_gen_snap_task() {
+                gen_task.set_for_balance();
+            }
         }
         Ok(())
     }
 
-    fn report_persist_log_duration(&self, pre_persist_index: u64, metrics: &mut RaftMetrics) {
+    fn report_persist_log_duration(&self, pre_persist_index: u64, metrics: &RaftMetrics) {
         if !metrics.waterfall_metrics || self.proposals.is_empty() {
             return;
         }
@@ -2036,7 +1953,7 @@ where
         }
     }
 
-    fn report_commit_log_duration(&self, pre_commit_index: u64, metrics: &mut RaftMetrics) {
+    fn report_commit_log_duration(&self, pre_commit_index: u64, metrics: &RaftMetrics) {
         if !metrics.waterfall_metrics || self.proposals.is_empty() {
             return;
         }
@@ -2056,21 +1973,10 @@ where
                         &metrics.wf_commit_not_persist_log
                     };
                     for tracker in trackers {
-                        // Collect the metrics related to commit_log
-                        // durations.
-                        let duration = tracker.observe(now, hist, |t| {
+                        tracker.observe(now, hist, |t| {
                             t.metrics.commit_not_persisted = !commit_persisted;
                             &mut t.metrics.wf_commit_log_nanos
                         });
-                        // Normally, commit_log_duration both contains the duraiton on persisting
-                        // raft logs and transferring raft logs to other nodes. Therefore, it can
-                        // reflects slowness of the node on I/Os, whatever the reason is.
-                        // Here, health_stats uses the recorded commit_log_duration as the
-                        // latency to perspect whether there exists jitters on network. It's not
-                        // accurate, but it's proved that it's a good approximation.
-                        metrics
-                            .health_stats
-                            .observe(Duration::from_nanos(duration), IoType::Network);
                     }
                 }
             }
@@ -2248,16 +2154,13 @@ where
         let region = self.region();
         let mut replicated_idx = self.raft_group.raft.raft_log.persisted;
         for (peer_id, p) in self.raft_group.raft.prs().iter() {
-            let peer = region
+            let store_id = region
                 .get_peers()
                 .iter()
                 .find(|p| p.get_id() == *peer_id)
-                .unwrap();
-            // Learners like TiFlash are ignored, because they may be tombstoned in earlier
-            // stage of the unsafe recovery process, so that forced leader
-            // cannot append logs to them.
-            if failed_stores.contains(&peer.get_store_id()) || peer.get_role() == PeerRole::Learner
-            {
+                .unwrap()
+                .get_store_id();
+            if failed_stores.contains(&store_id) {
                 continue;
             }
             if replicated_idx > p.matched {
@@ -2360,7 +2263,7 @@ where
                     // Init the in-memory pessimistic lock table when the peer becomes leader.
                     self.activate_in_memory_pessimistic_locks();
                     // Exit entry cache warmup state when the peer becomes leader.
-                    self.transfer_leader_state.cache_warmup_state = None;
+                    self.mut_store().clear_entry_cache_warmup_state();
 
                     if !ctx.store_disk_usages.is_empty() {
                         self.refill_disk_full_peers(ctx);
@@ -2407,7 +2310,7 @@ where
                 RoleChange {
                     state: ss.raft_state,
                     leader_id: ss.leader_id,
-                    prev_lead_transferee: self.transfer_leader_state.leader_transferee,
+                    prev_lead_transferee: self.lead_transferee,
                     vote: self.raft_group.raft.vote,
                     initialized: self.is_initialized(),
                     peer_id: self.peer.get_id(),
@@ -2419,8 +2322,7 @@ where
                 self.on_leader_changed(self.leader_id(), hs.get_term());
             }
         }
-        self.transfer_leader_state.leader_transferee =
-            self.raft_group.raft.lead_transferee.unwrap_or_default();
+        self.lead_transferee = self.raft_group.raft.lead_transferee.unwrap_or_default();
     }
 
     /// Correctness depends on the order between calling this function and
@@ -2492,10 +2394,6 @@ where
             "term" => term,
             "peer_id" => self.peer_id(),
         );
-
-        // TODO: Set last_index as the min_index may not be correct on follower,
-        // need to further consider a better solution.
-        self.disable_apply_unpersisted_log(self.raft_group.raft.raft_log.last_index());
 
         self.read_progress
             .update_leader_info(leader_id, term, self.region());
@@ -2625,14 +2523,14 @@ where
             CheckApplyingSnapStatus::Applying => {
                 // If this peer is applying snapshot, we should not get a new ready.
                 // There are two reasons in my opinion:
-                //   1. If we handle a new ready and persist the data(e.g. entries), we can not
-                //      tell raft-rs that this ready has been persisted because the ready need
-                //      to be persisted one by one from raft-rs's view.
-                //   2. When this peer is applying snapshot, the response msg should not be sent
-                //      to leader, thus the leader will not send new entries to this peer.
-                //      Although it's possible a new leader may send a AppendEntries msg to this
-                //      peer, this possibility is very low. In most cases, there is no msg need
-                //      to be handled.
+                //   1. If we handle a new ready and persist the data(e.g. entries),
+                //      we can not tell raft-rs that this ready has been persisted because
+                //      the ready need to be persisted one by one from raft-rs's view.
+                //   2. When this peer is applying snapshot, the response msg should not
+                //      be sent to leader, thus the leader will not send new entries to
+                //      this peer. Although it's possible a new leader may send a AppendEntries
+                //      msg to this peer, this possibility is very low. In most cases, there
+                //      is no msg need to be handled.
                 // So we choose to not get a new ready which makes the logic more clear.
                 debug!(
                     "still applying snapshot, skip further handling";
@@ -2733,57 +2631,6 @@ where
         }
     }
 
-    /// Cancel the snapshot generation task under the following conditions:
-    ///
-    /// 1. The requesting peer is removed by a configuration change.
-    /// 2. The requesting peer becomes unreachable, e.g., TiKV goes down or a
-    ///    network partition occurs.
-    pub fn maybe_cancel_gen_snap_task(&self, unreachable_store_id: Option<u64>) {
-        let to_peer = match self.get_store().get_gen_snap_task().as_ref() {
-            Some(task) => task.to_peer.clone(),
-            None => return,
-        };
-        let cancel_by_unreachable_store =
-            unreachable_store_id.map_or(false, |s| to_peer.get_store_id() == s);
-        let cancel_by_peer_not_found = find_peer_by_id(self.region(), to_peer.get_id()).is_none();
-        if cancel_by_unreachable_store || cancel_by_peer_not_found {
-            self.get_store().cancel_generating_snap(None);
-            warn!(
-                "cancel generate snap task";
-                "region_id" => self.region_id,
-                "peer_id" => self.peer_id(),
-                "to_peer" => ?to_peer,
-                "cancel_by_peer_not_found" => cancel_by_peer_not_found,
-                "cancel_by_unreachable_store" => cancel_by_unreachable_store,
-            );
-        }
-    }
-
-    pub fn handle_gen_snap_task<T: Transport>(&mut self, ctx: &mut PollContext<EK, ER, T>) {
-        // Check if gen snap task need to be cancelled, otherwise it will block
-        // snapshot and subsequent conf changes.
-        self.maybe_cancel_gen_snap_task(None);
-
-        if self.get_store().has_gen_snap_task() {
-            // If the snapshot gen precheck feature is enabled, the leader needs
-            // to complete a precheck with the target follower before the
-            // snapshot generation.
-            if ctx.feature_gate.can_enable(SNAP_GEN_PRECHECK_FEATURE) {
-                // Continuously send snap gen precheck requests to the follower
-                // until an approval is received.
-                if let Some(to_peer) = self.get_store().need_gen_snap_precheck() {
-                    self.send_snap_gen_precheck_request(ctx, &to_peer);
-                }
-            } else {
-                let gen_task = self.mut_store().take_gen_snap_task().unwrap();
-                self.pending_request_snapshot_count
-                    .fetch_add(1, Ordering::SeqCst);
-                ctx.apply_router
-                    .schedule_task(self.region_id, ApplyTask::Snapshot(gen_task));
-            }
-        }
-    }
-
     pub fn handle_raft_ready_append<T: Transport>(
         &mut self,
         ctx: &mut PollContext<EK, ER, T>,
@@ -2845,7 +2692,13 @@ where
 
         if !self.raft_group.has_ready() {
             fail_point!("before_no_ready_gen_snap_task", |_| None);
-            self.handle_gen_snap_task(ctx);
+            // Generating snapshot task won't set ready for raft group.
+            if let Some(gen_task) = self.mut_store().take_gen_snap_task() {
+                self.pending_request_snapshot_count
+                    .fetch_add(1, Ordering::SeqCst);
+                ctx.apply_router
+                    .schedule_task(self.region_id, ApplyTask::Snapshot(gen_task));
+            }
             return None;
         }
 
@@ -2922,7 +2775,12 @@ where
         // needs to be sent to the apply system.
         // Always sending snapshot task behind apply task, so it gets latest
         // snapshot.
-        self.handle_gen_snap_task(ctx);
+        if let Some(gen_task) = self.mut_store().take_gen_snap_task() {
+            self.pending_request_snapshot_count
+                .fetch_add(1, Ordering::SeqCst);
+            ctx.apply_router
+                .schedule_task(self.region_id, ApplyTask::Snapshot(gen_task));
+        }
 
         let state_role = ready.ss().map(|ss| ss.raft_state);
         let has_new_entries = !ready.entries().is_empty();
@@ -3172,13 +3030,6 @@ where
                             // In this case the apply can be guaranteed to be successful. Invoke the
                             // on_committed callback if necessary.
                             p.cb.invoke_committed();
-
-                            debug!("raft log is committed";
-                                "req_info" => TrackerTokenArray::new(p.cb.write_trackers()
-                                    .into_iter()
-                                    .filter_map(|time_tracker| time_tracker.as_tracker_token())
-                                    .collect::<Vec<_>>().as_slice())
-                            );
                         }
                         p
                     })
@@ -3208,6 +3059,7 @@ where
                 cbs,
                 self.region_buckets_info()
                     .bucket_stat()
+                    .as_ref()
                     .map(|b| b.meta.clone()),
             );
             apply.on_schedule(&ctx.raft_metrics);
@@ -3219,10 +3071,6 @@ where
             }
             ctx.apply_router
                 .schedule_task(self.region_id, ApplyTask::apply(apply));
-            let apply_ahead_delta = self
-                .last_applying_idx
-                .saturating_sub(self.raft_group.raft.r.raft_log.persisted);
-            RAFT_APPLY_AHEAD_PERSIST_HISTOGRAM.observe(apply_ahead_delta as f64);
         }
         fail_point!("after_send_to_apply_1003", self.peer_id() == 1003, |_| {});
     }
@@ -3372,8 +3220,8 @@ where
             let pre_persist_index = self.raft_group.raft.raft_log.persisted;
             let pre_commit_index = self.raft_group.raft.raft_log.committed;
             self.raft_group.on_persist_ready(self.persisted_number);
-            self.report_persist_log_duration(pre_persist_index, &mut ctx.raft_metrics);
-            self.report_commit_log_duration(pre_commit_index, &mut ctx.raft_metrics);
+            self.report_persist_log_duration(pre_persist_index, &ctx.raft_metrics);
+            self.report_commit_log_duration(pre_commit_index, &ctx.raft_metrics);
 
             let persist_index = self.raft_group.raft.raft_log.persisted;
             self.mut_store().update_cache_persisted(persist_index);
@@ -3417,8 +3265,8 @@ where
         let pre_persist_index = self.raft_group.raft.raft_log.persisted;
         let pre_commit_index = self.raft_group.raft.raft_log.committed;
         let mut light_rd = self.raft_group.advance_append(ready);
-        self.report_persist_log_duration(pre_persist_index, &mut ctx.raft_metrics);
-        self.report_commit_log_duration(pre_commit_index, &mut ctx.raft_metrics);
+        self.report_persist_log_duration(pre_persist_index, &ctx.raft_metrics);
+        self.report_commit_log_duration(pre_commit_index, &ctx.raft_metrics);
 
         let persist_index = self.raft_group.raft.raft_log.persisted;
         if self.is_in_force_leader() {
@@ -3701,10 +3549,8 @@ where
         );
 
         if !self.is_leader() {
-            self.raft_group.mut_store().compact_entry_cache(
-                apply_state.applied_index + 1,
-                self.transfer_leader_state.cache_warmup_state.as_mut(),
-            );
+            self.mut_store()
+                .compact_entry_cache(apply_state.applied_index + 1);
         }
 
         let progress_to_be_updated = self.mut_store().applied_term() != applied_term;
@@ -3935,9 +3781,6 @@ where
                         .post_propose(cmd_type, idx, self.term());
                 }
                 self.post_propose(ctx, p);
-                if req_admin_cmd_type == Some(AdminCmdType::PrepareMerge) {
-                    self.disable_apply_unpersisted_log(idx);
-                }
                 true
             }
         }
@@ -3990,7 +3833,7 @@ where
         self.should_wake_up = true;
     }
 
-    fn pre_transfer_leader(&mut self, peer: &metapb::Peer, context: TransferLeaderContext) -> bool {
+    fn pre_transfer_leader(&mut self, peer: &metapb::Peer) -> bool {
         // Broadcast heartbeat to make sure followers commit the entries immediately.
         // It's only necessary to ping the target peer, but ping all for simplicity.
         self.raft_group.ping();
@@ -4004,18 +3847,7 @@ where
         // log is always its current term. Not just set term because raft library
         // forbids setting it for MsgTransferLeader messages.
         msg.set_log_term(self.term());
-        let ctx = context.to_bytes().unwrap_or_else(|e| {
-            warn!(
-                "failed to encode transfer leader context";
-                "region_id" => self.region_id,
-                "peer_id" => self.peer.get_id(),
-                "err" => ?e,
-            );
-            Bytes::new()
-        });
-        msg.set_context(ctx);
         self.raft_group.raft.msgs.push(msg);
-
         true
     }
 
@@ -4539,71 +4371,7 @@ where
         poll_ctx: &mut PollContext<EK, ER, T>,
         req: &mut RaftCmdRequest,
     ) -> Result<ProposalContext> {
-        poll_ctx
-            .coprocessor_host
-            .pre_propose(self.region(), req)
-            .map_err(|e| {
-                // If the error of prepropose contains str `NO_VALID_SPLIT_KEY`, it may mean the
-                // split_key of the split request is the region start key which
-                // means we may have so many potential duplicate mvcc versions
-                // that we can not manage to get a valid split key. So, we
-                // trigger a compaction to handle it.
-                if e.to_string().contains(NO_VALID_SPLIT_KEY) {
-                    let safe_ts = (|| {
-                        fail::fail_point!("safe_point_inject", |t| {
-                            t.unwrap().parse::<u64>().unwrap()
-                        });
-                        poll_ctx.safe_point.load(Ordering::Relaxed)
-                    })();
-                    if safe_ts <= self.last_record_safe_point {
-                        debug!(
-                            "skip schedule compact range due to safe_point not updated";
-                            "region_id" => self.region_id,
-                            "safe_point" => safe_ts,
-                        );
-                        return e;
-                    }
-
-                    let start_key = enc_start_key(self.region());
-                    let end_key = enc_end_key(self.region());
-
-                    let mut all_scheduled = true;
-                    for cf in [CF_WRITE, CF_DEFAULT] {
-                        let task = CompactTask::Compact {
-                            cf_name: String::from(cf),
-                            start_key: Some(start_key.clone()),
-                            end_key: Some(end_key.clone()),
-                            bottommost_level_force: true,
-                        };
-
-                        if let Err(e) = poll_ctx
-                            .cleanup_scheduler
-                            .schedule(CleanupTask::Compact(task))
-                        {
-                            error!(
-                                "schedule compact range task failed";
-                                "region_id" => self.region_id,
-                                "cf" => ?cf,
-                                "err" => ?e,
-                            );
-                            all_scheduled = false;
-                            break;
-                        }
-                    }
-
-                    if all_scheduled {
-                        info!(
-                            "schedule compact range due to no valid split keys";
-                            "region_id" => self.region_id,
-                            "safe_point" => safe_ts,
-                            "region_start_key" => log_wrappers::Value::key(&start_key),
-                            "region_end_key" => log_wrappers::Value::key(&end_key),
-                        );
-                        self.last_record_safe_point = safe_ts;
-                    }
-                }
-                e
-            })?;
+        poll_ctx.coprocessor_host.pre_propose(self.region(), req)?;
         let mut ctx = ProposalContext::empty();
 
         if get_sync_log_from_request(req) {
@@ -4761,15 +4529,6 @@ where
         Ok(Either::Left(propose_index))
     }
 
-    /// Check if the transferee is eligible to receive the leadership. It
-    /// rejects the transfer leader request if any of the following
-    /// conditions is met:
-    /// * The peer is applying a snapshot
-    /// * The peer is a learner/witness peer.
-    /// * The message is sent by a different leader.
-    /// * Its disk is almost full.
-    ///
-    /// Called by transferee.
     pub fn maybe_reject_transfer_leader_msg<T>(
         &mut self,
         ctx: &mut PollContext<EK, ER, T>,
@@ -4803,90 +4562,23 @@ where
         false
     }
 
-    /// Set a pending transfer leader message to allow the transferee to
-    /// initiate raft log cache warmup and other necessary works.
-    /// The message will be cleaned up once the transferee has warmed up its
-    /// cache or the peer becomes leader.
+    /// Before ack the transfer leader message sent by the leader.
+    /// Currently, it only warms up the entry cache in this stage.
     ///
-    /// Called by transferee.
-    pub fn set_pending_transfer_leader_msg(&mut self, cfg: &Config, msg: &eraftpb::Message) {
-        // log_term is set by original leader in pre transfer leader stage.
-        // Callers must guarantee that the message is a valid transfer leader
-        // message.
-        //
-        // See more in `Peer::pre_transfer_leader`.
-        assert!(
-            msg.get_msg_type() == eraftpb::MessageType::MsgTransferLeader
-                && msg.get_log_term() == self.term(),
-            "{} unexpected message type {:?}",
-            self.tag,
-            msg.get_msg_type(),
-        );
-
-        // We don't want to block transfer leader indefinitely, so set a
-        // deadline for the transferee to warm up its cache and other necessary
-        // works. Half of the election timeout should be long enough.
-        let half_election_timeout = cfg.raft_base_tick_interval.0
-            * std::cmp::max(1, cfg.raft_election_timeout_ticks / 2) as u32;
-        // Cache warmup has its own timeout, so we need to wait for the longer
-        // one.
-        let max_wait_duration =
-            std::cmp::max(half_election_timeout, cfg.max_entry_cache_warmup_duration.0);
-        let deadline = Instant::now() + max_wait_duration;
-        self.transfer_leader_state.transfer_leader_msg = Some((msg.clone(), deadline));
-    }
-
-    /// Ack transfer leader message if there is a pending transfer leader
-    /// message and the transferee has warmed up its raft log cache.
-    ///
-    /// Called by transferee.
-    pub fn maybe_ack_transfer_leader_msg<T>(&mut self, ctx: &mut PollContext<EK, ER, T>) -> bool {
-        if self.is_leader() {
-            self.transfer_leader_state.transfer_leader_msg = None;
-            return false;
-        }
-
-        let Some((msg, deadline)) = &self.transfer_leader_state.transfer_leader_msg else {
-            // There is no pending transfer leader message, do not ack.
-            return false;
-        };
-
-        // Ack the message if any of the following conditions is met:
-        //
-        // * The deadline is exceeded.
-        // * The cache has warmed up and coprocessors are ready to ack.
-        let is_deadline_exceeded = Instant::now() >= *deadline;
-        let is_cop_ready = ctx
-            .coprocessor_host
-            .pre_ack_transfer_leader(self.region(), msg);
-        let is_cache_ready = self.maybe_transfer_leader_cache_warmup(ctx, msg.get_index());
-
-        let is_ready_ack = is_deadline_exceeded || (is_cache_ready && is_cop_ready);
-        if !is_ready_ack {
-            return false;
-        }
-
-        self.ack_transfer_leader_msg(false);
-        self.transfer_leader_state.transfer_leader_msg = None;
-        true
-    }
-
-    /// Check if the cache has warmed up (caching raft logs >= low_index).
-    /// If the cache has not warmed up, it will try to warm up the cache.
-    ///
-    /// Returns true if the cache has warmed up or the warmup operation is
-    /// timed out.
-    fn maybe_transfer_leader_cache_warmup<T>(
+    /// This return whether the msg should be acked. When cache is warmed up
+    /// or the warmup operation is timeout, it is true.
+    pub fn pre_ack_transfer_leader_msg<T>(
         &mut self,
         ctx: &mut PollContext<EK, ER, T>,
-        low_index: u64,
+        msg: &eraftpb::Message,
     ) -> bool {
         if !ctx.cfg.warmup_entry_cache_enabled() {
             return true;
         }
+
         // The start index of warmup range. It is leader's entry_cache_first_index,
         // which in general is equal to the lowest matched index.
-        let mut low = low_index;
+        let mut low = msg.get_index();
         let last_index = self.get_store().last_index();
         let mut should_ack_now = false;
 
@@ -4917,38 +4609,13 @@ where
             return true;
         }
 
-        // Reset cache warmup state if an election timeout has passed since the
-        // previous warmup, because cache may have been invalidated by
-        // `compact_entry_cache` and a new leader may have been elected.
-        // The reset allows it to initiate a new warmup operation.
-        let cache_warmup_state = &mut self.transfer_leader_state.cache_warmup_state;
-        if cache_warmup_state.as_mut().is_some_and(|s| s.check_stale()) {
-            info!("reset stale cache warmup state";
-                "region_id" => self.region_id,
-                "peer_id" => self.peer_id(),
-                "range" => ?self.transfer_leader_state.cache_warmup_state.as_ref().unwrap().range(),
-            );
-            self.transfer_leader_state.cache_warmup_state = None;
-        }
-
         // Check if the warmup operation is timeout if warmup is already started.
-        if let Some(state) = &mut self.transfer_leader_state.cache_warmup_state {
+        if let Some(state) = self.mut_store().entry_cache_warmup_state_mut() {
             // If it is timeout, this peer should ack the message so that
             // the leadership transfer process can continue.
-            state.check_task_timeout()
-        } else if let Some((low, high)) = self.raft_group.mut_store().async_warm_up_entry_cache(low)
-        {
-            self.transfer_leader_state.cache_warmup_state = Some(CacheWarmupState::new(
-                low,
-                high,
-                ctx.cfg.max_entry_cache_warmup_duration.0,
-                ctx.cfg.raft_base_tick_interval.0 * ctx.cfg.raft_election_timeout_ticks as u32,
-            ));
-            false
+            state.check_task_timeout(ctx.cfg.max_entry_cache_warmup_duration.0)
         } else {
-            // Ack transfer leader immediately if async entry cache fails or
-            // have been warmed up already.
-            true
+            self.mut_store().async_warm_up_entry_cache(low).is_none()
         }
     }
 
@@ -4975,7 +4642,7 @@ where
         msg.set_index(self.get_store().applied_index());
         msg.set_log_term(self.term());
         if reply_cmd {
-            msg.set_context(TransferLeaderContext::CommandReply.to_bytes().unwrap());
+            msg.set_context(Bytes::from_static(TRANSFER_LEADER_COMMAND_REPLY_CTX));
         }
         self.raft_group.raft.msgs.push(msg);
     }
@@ -4986,51 +4653,50 @@ where
     /// to target follower first to ensures it's ready to become leader.
     /// After that the real transfer leader process begin.
     ///
-    /// 1. pre_transfer_leader on leader: Leader will send a MsgTransferLeader
-    ///    to follower.
-    /// 2. pre_ack_transfer_leader_msg on follower: If follower passes all
-    ///    necessary checks, it will try to warmup the entry cache.
-    /// 3. ack_transfer_leader_msg on follower: When the entry cache has been
-    ///    warmed up or the operator is timeout, the follower reply an ACK with
-    ///    type MsgTransferLeader and its promised persistent index.
+    /// 1. pre_transfer_leader on leader:
+    ///     Leader will send a MsgTransferLeader to follower.
+    /// 2. pre_ack_transfer_leader_msg on follower:
+    ///     If follower passes all necessary checks, it will try to warmup
+    ///     the entry cache.
+    /// 3. ack_transfer_leader_msg on follower:
+    ///     When the entry cache has been warmed up or the operator is timeout,
+    ///     the follower reply an ACK with type MsgTransferLeader and
+    ///     its promised persistent index.
     ///
     /// Additional steps when there are remaining pessimistic
     /// locks to propose (detected in function on_transfer_leader_msg).
     ///    1. Leader firstly proposes pessimistic locks and then proposes a
     ///       TransferLeader command.
-    ///    2. ack_transfer_leader_msg on follower again: The follower applies
-    ///       the TransferLeader command and replies an ACK with special context
-    ///       TransferLeaderContext::CommandReply.
+    ///    2. ack_transfer_leader_msg on follower again:
+    ///        The follower applies the TransferLeader command and replies an
+    ///        ACK with special context TRANSFER_LEADER_COMMAND_REPLY_CTX.
     ///
-    /// 4. ready_to_transfer_leader on leader: Leader checks if it's appropriate
-    ///    to transfer leadership. If it does, it calls raft transfer_leader API
-    ///    to do the remaining work.
+    /// 4. ready_to_transfer_leader on leader:
+    ///     Leader checks if it's appropriate to transfer leadership. If it
+    ///     does, it calls raft transfer_leader API to do the remaining work.
     ///
     /// See also: tikv/rfcs#37.
-    fn propose_transfer_leader<T: Transport>(
+    fn propose_transfer_leader<T>(
         &mut self,
         ctx: &mut PollContext<EK, ER, T>,
         req: RaftCmdRequest,
         cb: Callback<EK::Snapshot>,
     ) -> bool {
         let transfer_leader = get_transfer_leader_cmd(&req).unwrap();
-        let transfer_leader_ctx = match ctx
+        if let Err(err) = ctx
             .coprocessor_host
             .pre_transfer_leader(self.region(), transfer_leader)
         {
-            Err(err) => {
-                warn!("Coprocessor rejected transfer leader.";
-                    "err" => ?err,
-                    "region_id" => self.region_id,
-                    "peer_id" => self.peer.get_id(),
-                    "transferee" => transfer_leader.get_peer().get_id());
-                let mut resp = RaftCmdResponse::new();
-                *resp.mut_header().mut_error() = Error::from(err).into();
-                cb.invoke_with_response(resp);
-                return false;
-            }
-            Ok(ctx) => TransferLeaderContext::Custom(ctx),
-        };
+            warn!("Coprocessor rejected transfer leader."; "err" => ?err,
+                "region_id" => self.region_id,
+                "peer_id" => self.peer.get_id(),
+                "transferee" => transfer_leader.get_peer().get_id());
+            let mut resp = RaftCmdResponse::new();
+            *resp.mut_header().mut_error() = Error::from(err).into();
+            cb.invoke_with_response(resp);
+            return false;
+        }
+
         ctx.raft_metrics.propose.transfer_leader.inc();
 
         let prs = self.raft_group.raft.prs();
@@ -5055,14 +4721,14 @@ where
             });
         let peer = match peers.len() {
             0 => transfer_leader.get_peer(),
-            1 => peers.first().unwrap(),
+            1 => peers.get(0).unwrap(),
             _ => peers.choose(&mut rand::thread_rng()).unwrap(),
         };
 
         let transferred = if peer.id == self.peer.id {
             false
         } else {
-            self.pre_transfer_leader(peer, transfer_leader_ctx)
+            self.pre_transfer_leader(peer)
         };
 
         // transfer leader command doesn't need to replicate log and apply, so we
@@ -5249,29 +4915,17 @@ where
             }
         }
 
-        let read_ctx = if let Ok(read_ts) = decode_u64(&mut req.get_header().get_flag_data()) {
-            ReadContext::new(None, Some(read_ts))
-        } else {
-            ReadContext::new(None, None)
+        let mut resp = {
+            let _timer = ctx.raft_metrics.io_read_peer_snapshot_read.start_timer();
+            let reader = ctx;
+            reader.execute(&req, &Arc::new(region), read_index, None)
         };
-
-        let mut reader = PollContextReader {
-            engines: &ctx.engines,
-        };
-        let _timer = ctx.raft_metrics.io_read_peer_snapshot_read.start_timer();
-        let mut resp = reader.execute(
-            &read_ctx,
-            &req,
-            &Arc::new(region),
-            read_index,
-            None,
-            &ctx.coprocessor_host,
-        );
         if let Some(snap) = resp.snapshot.as_mut() {
             snap.txn_ext = Some(self.txn_ext.clone());
             snap.bucket_meta = self
                 .region_buckets_info()
                 .bucket_stat()
+                .as_ref()
                 .map(|s| s.meta.clone());
         }
         resp.txn_extra_op = self.txn_extra_op.load();
@@ -5453,7 +5107,7 @@ where
 
     // Check disk usages for the peer itself and other peers in the raft group.
     // The return value indicates whether the proposal is allowed or not.
-    fn check_normal_proposal_with_disk_full_opt<T: Transport>(
+    fn check_normal_proposal_with_disk_full_opt<T>(
         &mut self,
         ctx: &mut PollContext<EK, ER, T>,
         disk_full_opt: DiskFullOpt,
@@ -5489,7 +5143,7 @@ where
                         "peer_id" => self.peer.get_id(),
                         "target_peer_id" => p.get_id(),
                     );
-                    self.pre_transfer_leader(&p, TransferLeaderContext::None);
+                    self.pre_transfer_leader(&p);
                 }
             }
         } else {
@@ -5851,7 +5505,7 @@ where
             "region_id" => self.region_id,
             "peer_id" => self.peer.get_id(),
             "msg_type" => ?ty,
-            "to" => ?to
+            "to" => to.get_id()
         );
         send_msg.set_extra_msg(msg);
         send_msg.set_to_peer(to.clone());
@@ -5977,30 +5631,8 @@ where
         }
     }
 
-    pub fn send_snap_gen_precheck_request<T: Transport>(
-        &mut self,
-        ctx: &mut PollContext<EK, ER, T>,
-        to_peer: &metapb::Peer,
-    ) {
-        let mut extra_msg = ExtraMessage::default();
-        extra_msg.set_type(ExtraMessageType::MsgSnapGenPrecheckRequest);
-        self.send_extra_message(extra_msg, &mut ctx.trans, to_peer);
-    }
-
-    pub fn send_snap_gen_precheck_response<T: Transport>(
-        &mut self,
-        ctx: &mut PollContext<EK, ER, T>,
-        to_peer: &metapb::Peer,
-        passed: bool,
-    ) {
-        let mut extra_msg = ExtraMessage::default();
-        extra_msg.set_type(ExtraMessageType::MsgSnapGenPrecheckResponse);
-        extra_msg.set_snap_gen_precheck_passed(passed);
-        self.send_extra_message(extra_msg, &mut ctx.trans, to_peer);
-    }
-
     pub fn send_want_rollback_merge<T: Transport>(
-        &mut self,
+        &self,
         premerge_commit: u64,
         ctx: &mut PollContext<EK, ER, T>,
     ) {
@@ -6022,7 +5654,7 @@ where
         self.send_extra_message(extra_msg, &mut ctx.trans, &to_peer);
     }
 
-    pub fn require_updating_max_ts(&self, pd_scheduler: &Scheduler<PdTask<EK>>) {
+    pub fn require_updating_max_ts(&self, pd_scheduler: &Scheduler<PdTask<EK, ER>>) {
         let epoch = self.region().get_region_epoch();
         let term_low_bits = self.term() & ((1 << 32) - 1); // 32 bits
         let version_lot_bits = epoch.get_version() & ((1 << 31) - 1); // 31 bits
@@ -6105,30 +5737,12 @@ where
             self.raft_max_inflight_msgs = raft_max_inflight_msgs;
         }
         self.raft_group.raft.r.max_msg_size = ctx.cfg.raft_max_size_per_msg.0;
-        self.max_apply_unpersisted_log_limit = ctx.cfg.max_apply_unpersisted_log_limit;
-        if self
-            .raft_group
-            .raft
-            .raft_log
-            .max_apply_unpersisted_log_limit
-            != self.max_apply_unpersisted_log_limit
-        {
-            if self.max_apply_unpersisted_log_limit == 0 {
-                self.disable_apply_unpersisted_log(0);
-            } else if self.is_leader() {
-                // Currently only enable unpersisted apply on leader.
-                self.maybe_update_apply_unpersisted_log_state(
-                    self.raft_group.raft.raft_log.applied,
-                );
-            }
-        }
     }
 
     /// Update states of the peer which can be changed in the previous raft
     /// tick.
     pub fn post_raft_group_tick(&mut self) {
-        self.transfer_leader_state.leader_transferee =
-            self.raft_group.raft.lead_transferee.unwrap_or_default();
+        self.lead_transferee = self.raft_group.raft.lead_transferee.unwrap_or_default();
     }
 }
 
@@ -6252,11 +5866,7 @@ where
     }
 }
 
-struct PollContextReader<'a, EK, ER> {
-    engines: &'a Engines<EK, ER>,
-}
-
-impl<'a, EK, ER> ReadExecutor for PollContextReader<'a, EK, ER>
+impl<EK, ER, T> ReadExecutor for PollContext<EK, ER, T>
 where
     EK: KvEngine,
     ER: RaftEngine,
@@ -6339,90 +5949,7 @@ pub fn make_transfer_leader_response() -> RaftCmdResponse {
 
 // The Raft message context for a MsgTransferLeader if it is a reply of a
 // TransferLeader command.
-const TRANSFER_LEADER_COMMAND_REPLY_CTX: &[u8] = &[1];
-
-/// The Raft message context for a MsgTransferLeader
-#[derive(Debug, PartialEq)]
-pub enum TransferLeaderContext {
-    /// None is a zero-length context.
-    None,
-    /// A reply of a AdminCmd TransferLeader.
-    /// Tag: 1.
-    CommandReply,
-    /// A context from TransferLeaderObserver coprocessors.
-    /// Tag: 2.
-    Custom(Vec<TransferLeaderCustomContext>),
-}
-
-impl TransferLeaderContext {
-    const TAG_COMMAND_REPLY: u8 = TRANSFER_LEADER_COMMAND_REPLY_CTX[0]; // 1.
-    const TAG_CUSTOM: u8 = 2;
-    pub fn from_bytes(mut ctx: &[u8]) -> Result<TransferLeaderContext> {
-        if ctx.is_empty() {
-            return Ok(TransferLeaderContext::None);
-        }
-        match box_try!(ctx.read_u8()) {
-            Self::TAG_COMMAND_REPLY => Ok(TransferLeaderContext::CommandReply),
-            Self::TAG_CUSTOM => {
-                let mut coprocessor_ctx = vec![];
-                while !ctx.is_empty() {
-                    let len = box_try!(ctx.read_var_u64()) as usize;
-                    let key = box_try!(ctx.read_bytes(len)).to_vec();
-                    let len = box_try!(ctx.read_var_u64()) as usize;
-                    let value = box_try!(ctx.read_bytes(len)).to_vec();
-                    coprocessor_ctx.push(TransferLeaderCustomContext { key, value });
-                }
-                Ok(TransferLeaderContext::Custom(coprocessor_ctx))
-            }
-            tag => Err(box_err!("invalid tag: {}", tag)),
-        }
-    }
-
-    pub fn to_bytes(&self) -> Result<Bytes> {
-        match self {
-            TransferLeaderContext::None => Ok(Bytes::new()),
-            TransferLeaderContext::CommandReply => {
-                Ok(Bytes::from_static(TRANSFER_LEADER_COMMAND_REPLY_CTX))
-            }
-            TransferLeaderContext::Custom(coprocessor_ctx) => {
-                let mut ctx = vec![];
-                box_try!(ctx.write_u8(Self::TAG_CUSTOM));
-                for cctx in coprocessor_ctx {
-                    let TransferLeaderCustomContext { key, value } = cctx;
-                    box_try!(ctx.write_var_u64(key.len() as u64));
-                    ctx.extend_from_slice(key);
-                    box_try!(ctx.write_var_u64(value.len() as u64));
-                    ctx.extend_from_slice(value);
-                }
-                Ok(Bytes::from(ctx))
-            }
-        }
-    }
-
-    pub fn get_custom_ctx(&self, key: &[u8]) -> Option<&[u8]> {
-        let TransferLeaderContext::Custom(cctx) = self else {
-            return None;
-        };
-        cctx.iter()
-            .find(|c| c.key == key)
-            .map(|c| c.value.as_slice())
-    }
-}
-
-#[derive(Default)]
-pub struct TransferLeaderState {
-    /// lead_transferee if leader is in a leadership transferring.
-    /// Only leader can update this field, and it is meaningful only when a peer
-    /// is a leader or a leader is stepping down.
-    pub leader_transferee: u64,
-    /// A pre transfer leader message sent from leader and a deadline for a
-    /// leader transferee to confirm the transfer leader message.
-    /// Only leader transferee can update this field.
-    pub transfer_leader_msg: Option<(eraftpb::Message, Instant)>,
-    /// The entry cache async warm up state that is issued by a pre transfer
-    /// leader message.
-    pub cache_warmup_state: Option<CacheWarmupState>,
-}
+pub const TRANSFER_LEADER_COMMAND_REPLY_CTX: &[u8] = &[1];
 
 mod memtrace {
     use std::mem;
@@ -6588,7 +6115,7 @@ mod tests {
         admin_req.clear_transfer_leader();
         req.clear_admin_request();
 
-        for (op, policy) in [
+        for (op, policy) in vec![
             (CmdType::Get, RequestPolicy::ReadLocal),
             (CmdType::Snap, RequestPolicy::ReadLocal),
             (CmdType::Put, RequestPolicy::ProposeNormal),
@@ -6741,7 +6268,7 @@ mod tests {
 
         // (1, 4) and (1, 5) is not committed
         let entries = vec![(1, 1), (1, 2), (1, 3), (1, 4), (1, 5), (2, 6), (2, 7)];
-        let committed = [(1, 1), (1, 2), (1, 3), (2, 6), (2, 7)];
+        let committed = vec![(1, 1), (1, 2), (1, 3), (2, 6), (2, 7)];
         for (index, term) in entries.clone() {
             if term != 1 {
                 continue;
@@ -6880,56 +6407,5 @@ mod tests {
         epoch_checker.attach_to_conflict_cmd(9, cb);
         drop(epoch_checker);
         rx.try_recv().unwrap();
-    }
-
-    #[test]
-    fn test_transfer_leader_context() {
-        let mut ctx = TransferLeaderContext::None;
-        assert_eq!(ctx.to_bytes().unwrap().as_ref(), b"");
-        assert_eq!(
-            TransferLeaderContext::from_bytes(b"").unwrap(),
-            TransferLeaderContext::None
-        );
-
-        ctx = TransferLeaderContext::CommandReply;
-        assert_eq!(
-            ctx.to_bytes().unwrap().as_ref(),
-            TRANSFER_LEADER_COMMAND_REPLY_CTX
-        );
-        assert_eq!(
-            TransferLeaderContext::from_bytes(TRANSFER_LEADER_COMMAND_REPLY_CTX).unwrap(),
-            TransferLeaderContext::CommandReply
-        );
-
-        ctx = TransferLeaderContext::Custom(vec![
-            TransferLeaderCustomContext {
-                key: b"key1".to_vec(),
-                value: b"value1".to_vec(),
-            },
-            TransferLeaderCustomContext {
-                key: b"key2".to_vec(),
-                value: b"value2".to_vec(),
-            },
-        ]);
-        let bytes = ctx.to_bytes().unwrap();
-        assert_eq!(TransferLeaderContext::from_bytes(&bytes).unwrap(), ctx);
-        assert_eq!(
-            TransferLeaderContext::from_bytes(&bytes)
-                .unwrap()
-                .get_custom_ctx(b"key1"),
-            Some(b"value1".as_slice())
-        );
-        assert_eq!(
-            TransferLeaderContext::from_bytes(&bytes)
-                .unwrap()
-                .get_custom_ctx(b"key2"),
-            Some(b"value2".as_slice())
-        );
-        assert_eq!(
-            TransferLeaderContext::from_bytes(&bytes)
-                .unwrap()
-                .get_custom_ctx(b"key3".as_slice()),
-            None
-        );
     }
 }

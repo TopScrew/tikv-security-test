@@ -2,20 +2,22 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use ::encryption::DataKeyManager;
 use engine_traits::{
-    Error, ExternalSstFileInfo, ExternalSstFileReader, IterOptions, Iterator, RefIterable, Result,
-    SstCompressionType, SstExt, SstReader, SstWriter, SstWriterBuilder, CF_DEFAULT,
+    EncryptionKeyManager, Error, ExternalSstFileInfo, IterOptions, Iterator, RefIterable, Result,
+    SstCompressionType, SstExt, SstMetaInfo, SstReader, SstWriter, SstWriterBuilder, CF_DEFAULT,
 };
 use fail::fail_point;
-use file_system::get_io_rate_limiter;
+use kvproto::import_sstpb::SstMeta;
 use rocksdb::{
     rocksdb::supported_compression, ColumnFamilyOptions, DBCompressionType, DBIterator, Env,
     EnvOptions, ExternalSstFileInfo as RawExternalSstFileInfo, SequentialFile, SstFileReader,
     SstFileWriter, DB,
 };
+use tikv_util::box_err;
 
-use crate::{engine::RocksEngine, get_env, options::RocksReadOptions, r2e};
+use crate::{
+    encryption::WrappedEncryptionKeyManager, engine::RocksEngine, options::RocksReadOptions, r2e,
+};
 
 impl SstExt for RocksEngine {
     type SstReader = RocksSstReader;
@@ -28,6 +30,19 @@ pub struct RocksSstReader {
 }
 
 impl RocksSstReader {
+    pub fn sst_meta_info(&self, sst: SstMeta) -> SstMetaInfo {
+        let mut meta = SstMetaInfo {
+            total_kvs: 0,
+            total_bytes: 0,
+            meta: sst,
+        };
+        self.inner.read_table_properties(|p| {
+            meta.total_kvs = p.num_entries();
+            meta.total_bytes = p.raw_key_size() + p.raw_value_size();
+        });
+        meta
+    }
+
     pub fn open_with_env(path: &str, env: Option<Arc<Env>>) -> Result<Self> {
         let mut cf_options = ColumnFamilyOptions::new();
         if let Some(env) = env {
@@ -48,23 +63,20 @@ impl RocksSstReader {
 }
 
 impl SstReader for RocksSstReader {
-    fn open(path: &str, mgr: Option<Arc<DataKeyManager>>) -> Result<Self> {
-        let env = get_env(mgr, get_io_rate_limiter())?;
-        Self::open_with_env(path, Some(env))
+    fn open(path: &str) -> Result<Self> {
+        Self::open_with_env(path, None)
     }
-
+    fn open_encrypted<E: EncryptionKeyManager>(path: &str, mgr: Arc<E>) -> Result<Self> {
+        let env = Env::new_key_managed_encrypted_env(
+            Arc::default(),
+            WrappedEncryptionKeyManager::new(mgr),
+        )
+        .map_err(|err| Error::Other(box_err!("failed to open encrypted env: {}", err)))?;
+        Self::open_with_env(path, Some(Arc::new(env)))
+    }
     fn verify_checksum(&self) -> Result<()> {
-        self.inner.verify_checksum().map_err(r2e)
-    }
-
-    fn kv_count_and_size(&self) -> (u64, u64) {
-        let mut count = 0;
-        let mut bytes = 0;
-        self.inner.read_table_properties(|p| {
-            count = p.num_entries();
-            bytes = p.raw_key_size() + p.raw_value_size();
-        });
-        (count, bytes)
+        self.inner.verify_checksum().map_err(r2e)?;
+        Ok(())
     }
 }
 
@@ -243,31 +255,9 @@ pub struct RocksSstWriter {
     env: Option<Arc<Env>>,
 }
 
-pub struct ResettableSequentualFile {
-    env: Arc<Env>,
-    path: String,
-    state: SequentialFile,
-}
-
-impl std::io::Read for ResettableSequentualFile {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.state.read(buf)
-    }
-}
-
-impl ExternalSstFileReader for ResettableSequentualFile {
-    fn reset(&mut self) -> Result<()> {
-        self.state = self
-            .env
-            .new_sequential_file(&self.path, EnvOptions::new())
-            .map_err(r2e)?;
-        Ok(())
-    }
-}
-
 impl SstWriter for RocksSstWriter {
     type ExternalSstFileInfo = RocksExternalSstFileInfo;
-    type ExternalSstFileReader = ResettableSequentualFile;
+    type ExternalSstFileReader = SequentialFile;
 
     fn put(&mut self, key: &[u8], val: &[u8]) -> Result<()> {
         self.writer.put(key, val).map_err(r2e)
@@ -301,12 +291,7 @@ impl SstWriter for RocksSstWriter {
         let seq_file = env
             .new_sequential_file(path, EnvOptions::new())
             .map_err(r2e)?;
-        let reset_file = ResettableSequentualFile {
-            env,
-            path: path.to_owned(),
-            state: seq_file,
-        };
-        Ok((RocksExternalSstFileInfo(sst_info), reset_file))
+        Ok((RocksExternalSstFileInfo(sst_info), seq_file))
     }
 }
 
@@ -428,10 +413,5 @@ mod tests {
         assert_eq!(buf.len() as u64, sst_file.file_size());
         // There must not be a file in disk.
         std::fs::metadata(p).unwrap_err();
-
-        let mut buf2 = vec![];
-        reader.reset().unwrap();
-        reader.read_to_end(&mut buf2).unwrap();
-        assert_eq!(buf, buf2);
     }
 }

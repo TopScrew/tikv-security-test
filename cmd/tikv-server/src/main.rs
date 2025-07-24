@@ -5,7 +5,6 @@
 use std::{path::Path, process};
 
 use clap::{crate_authors, App, Arg};
-use crypto::fips;
 use serde_json::{Map, Value};
 use server::setup::{ensure_no_unrecognized_config, validate_and_persist_config};
 use tikv::{
@@ -14,17 +13,14 @@ use tikv::{
 };
 
 fn main() {
-    // OpenSSL FIPS mode should be enabled at the very start.
-    fips::maybe_enable();
-
     let build_timestamp = option_env!("TIKV_BUILD_TIME");
     let version_info = tikv::tikv_version_info(build_timestamp);
 
     let matches = App::new("TiKV")
         .about("A distributed transactional key-value database powered by Rust and Raft")
         .author(crate_authors!())
-        .version::<&str>(version_info.as_ref())
-        .long_version::<&str>(version_info.as_ref())
+        .version(version_info.as_ref())
+        .long_version(version_info.as_ref())
         .arg(
             Arg::with_name("config")
                 .short("C")
@@ -220,26 +216,6 @@ fn main() {
         println!("invalid storage.engine configuration: {}", e);
         process::exit(1)
     }
-
-    // Initialize the async-backtrace.
-    #[cfg(feature = "trace-async-tasks")]
-    {
-        use tracing_subscriber::prelude::*;
-        tracing_subscriber::registry()
-            .with(tracing_active_tree::layer::global().clone())
-            .init();
-    }
-
-    // Sets the global logger ASAP.
-    // It is okay to use the config w/o `validate()`,
-    // because `initial_logger()` handles various conditions.
-    server::setup::initial_logger(&config);
-
-    // Print version information.
-    tikv::log_tikv_info(build_timestamp);
-
-    // Print OpenSSL FIPS mode status.
-    fips::log_status();
 
     // Init memory related settings.
     config.memory.init();

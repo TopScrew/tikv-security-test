@@ -486,7 +486,7 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
         let low = logs.low;
         // If the peer is not the leader anymore and it's not in entry cache warmup
         // state, or it is being destroyed, ignore the result.
-        if !self.is_leader() && self.transfer_leader_state().cache_warmup_state.is_none()
+        if !self.is_leader() && self.entry_storage().entry_cache_warmup_state().is_none()
             || !self.serving()
         {
             self.entry_storage_mut().clean_async_fetch_res(low);
@@ -494,9 +494,11 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
         }
         if self.term() != logs.term {
             self.entry_storage_mut().clean_async_fetch_res(low);
-        } else if let Some(state) = self.transfer_leader_state().cache_warmup_state.clone() {
-            self.entry_storage_mut()
-                .on_async_warm_up_entry_cache_fetched(*logs, state.range());
+        } else if self.entry_storage().entry_cache_warmup_state().is_some() {
+            if self.entry_storage_mut().maybe_warm_up_entry_cache(*logs) {
+                self.ack_transfer_leader_msg(false);
+                self.set_has_ready();
+            }
             self.entry_storage_mut().clean_async_fetch_res(low);
             return;
         } else {
@@ -599,7 +601,7 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
         debug!(
             self.logger,
             "send raft msg";
-            "msg_type" => %util::MsgType(&msg),
+            "msg_type" => ?msg_type,
             "msg_size" => msg.get_message().compute_size(),
             "to" => to_peer_id,
         );
@@ -1084,7 +1086,7 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
                     );
 
                     // Exit entry cache warmup state when the peer becomes leader.
-                    self.transfer_leader_state_mut().cache_warmup_state = None;
+                    self.entry_storage_mut().clear_entry_cache_warmup_state();
 
                     if !ctx.store_disk_usages.is_empty() {
                         self.refill_disk_full_peers(ctx);

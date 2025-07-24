@@ -1,13 +1,11 @@
 # Sort the member alphabetically.
 aliases:
   sig-critical-approvers-config-components:
-    - BenMeadowcroft
-    - yudongusa
+    - easonn7
     - zhangjinpeng87
   sig-critical-approvers-config-src:
-    - BenMeadowcroft
+    - easonn7
     - cfzjywxk
-    - yudongusa
     - zhangjinpeng87
   sig-critical-approvers-config-cdc:
     - BenMeadowcroft

@@ -202,21 +202,9 @@ impl<EK: KvEngine, ER: RaftEngine> tikv_kv::Engine for RaftKv2<EK, ER> {
         let mut cmd = RaftCmdRequest::default();
         cmd.set_header(header);
         cmd.set_requests(vec![req].into());
-        let res: tikv_kv::Result<()> = (|| {
-            fail_point!("raftkv_async_snapshot_err", |_| {
-                Err(box_err!("injected error for async_snapshot"))
-            });
-            Ok(())
-        })();
-        let f = if res.is_err() {
-            None
-        } else {
-            Some(self.router.snapshot(cmd))
-        };
-
+        let f = self.router.snapshot(cmd);
         async move {
-            res?;
-            let res = f.unwrap().await;
+            let res = f.await;
             match res {
                 Ok(snap) => {
                     let elapse = begin_instant.saturating_elapsed_secs();
@@ -255,7 +243,7 @@ impl<EK: KvEngine, ER: RaftEngine> tikv_kv::Engine for RaftKv2<EK, ER> {
                 Err(mut resp) => {
                     if resp
                         .get_responses()
-                        .first()
+                        .get(0)
                         .map_or(false, |r| r.get_read_index().has_locked())
                     {
                         let locked = resp.mut_responses()[0].mut_read_index().take_locked();
@@ -273,12 +261,6 @@ impl<EK: KvEngine, ER: RaftEngine> tikv_kv::Engine for RaftKv2<EK, ER> {
                 }
             }
         }
-    }
-
-    type IMSnap = Self::Snap;
-    type IMSnapshotRes = Self::SnapshotRes;
-    fn async_in_memory_snapshot(&mut self, ctx: tikv_kv::SnapContext<'_>) -> Self::IMSnapshotRes {
-        self.async_snapshot(ctx)
     }
 
     type WriteRes = impl Stream<Item = WriteEvent> + Send + Unpin;

@@ -2,19 +2,21 @@
 use std::{
     cell::RefCell,
     fs,
+    fs::{File, OpenOptions},
     io::{self, BufReader, Read, Write},
     sync::Arc,
     usize,
 };
 
-use encryption::{DataKeyManager, DecrypterReader, EncrypterWriter, Iv};
+use encryption::{
+    from_engine_encryption_method, DataKeyManager, DecrypterReader, EncrypterWriter, Iv,
+};
 use engine_traits::{
-    CfName, Error as EngineError, ExternalSstFileInfo, IterOptions, Iterable, Iterator, KvEngine,
+    CfName, EncryptionKeyManager, Error as EngineError, IterOptions, Iterable, Iterator, KvEngine,
     Mutable, Range, RefIterable, SstCompressionType, SstReader, SstWriter, SstWriterBuilder,
     WriteBatch,
 };
 use fail::fail_point;
-use file_system::{File, IoBytesTracker, IoType, OpenOptions, WithIoType};
 use kvproto::encryptionpb::EncryptionMethod;
 use tikv_util::{
     box_try,
@@ -25,38 +27,15 @@ use tikv_util::{
 
 use super::{CfFile, Error, IO_LIMITER_CHUNK_SIZE};
 
-// This defines the number of bytes scanned before trigger an I/O limiter check.
-// It is used instead of checking the I/O limiter for each scan to reduce cpu
-// overhead.
-const SCAN_BYTES_PER_IO_LIMIT_CHECK: usize = 8 * 1024;
-
 /// Used to check a procedure is stale or not.
 pub trait StaleDetector {
     fn is_stale(&self) -> bool;
 }
 
-/// Statistics for tracking the process of building SST files.
 #[derive(Clone, Copy, Default)]
 pub struct BuildStatistics {
-    /// The total number of keys processed during the build.
     pub key_count: usize,
-
-    /// The total size (in bytes) of key-value pairs processed.
-    /// This represents the combined size of keys and values before any
-    /// compression.
-    pub total_kv_size: usize,
-
-    /// The total size (in bytes) of the generated SST files after compression.
-    /// This reflects the on-disk size of the output files.
-    pub total_sst_size: usize,
-
-    /// The total size (in bytes) of the raw data in plain text format.
-    /// This represents the uncompressed size of the CF_LOCK data.
-    pub total_plain_size: usize,
-
-    /// The total size (in bytes) of the IO used for read data.
-    /// This does not include usage from CF_LOCK.
-    pub total_io_size: usize,
+    pub total_size: usize,
 }
 
 /// Build a snapshot file for the given column family in plain format.
@@ -83,7 +62,7 @@ where
 
     if let Some(key_mgr) = key_mgr {
         let enc_info = box_try!(key_mgr.new_file(path));
-        let mthd = enc_info.method;
+        let mthd = from_engine_encryption_method(enc_info.method);
         if mthd != EncryptionMethod::Plaintext {
             let writer = box_try!(EncrypterWriter::new(
                 file.take().unwrap(),
@@ -105,7 +84,7 @@ where
     let mut stats = BuildStatistics::default();
     box_try!(snap.scan(cf, start_key, end_key, false, |key, value| {
         stats.key_count += 1;
-        stats.total_kv_size += key.len() + value.len();
+        stats.total_size += key.len() + value.len();
         box_try!(BytesEncoder::encode_compact_bytes(&mut writer, key));
         box_try!(BytesEncoder::encode_compact_bytes(&mut writer, value));
         Ok(true)
@@ -120,8 +99,6 @@ where
             encrypted_file.unwrap().finalize().unwrap()
         };
         box_try!(file.sync_all());
-        let metadata = box_try!(file.metadata());
-        stats.total_plain_size += metadata.len() as usize;
     } else {
         drop(file);
         box_try!(fs::remove_file(path));
@@ -142,7 +119,6 @@ pub fn build_sst_cf_file_list<E>(
     raw_size_per_file: u64,
     io_limiter: &Limiter,
     key_mgr: Option<Arc<DataKeyManager>>,
-    for_balance: bool,
 ) -> Result<BuildStatistics, Error>
 where
     E: KvEngine,
@@ -163,8 +139,8 @@ where
     let finish_sst_writer = |sst_writer: E::SstWriter,
                              path: String,
                              key_mgr: Option<Arc<DataKeyManager>>|
-     -> Result<u64, Error> {
-        let info = sst_writer.finish()?;
+     -> Result<(), Error> {
+        sst_writer.finish()?;
         (|| {
             fail_point!("inject_sst_file_corruption", |_| {
                 static CALLED: std::sync::atomic::AtomicBool =
@@ -186,7 +162,12 @@ where
             });
         })();
 
-        let sst_reader = E::SstReader::open(&path, key_mgr)?;
+        let sst_reader = if let Some(mgr) = key_mgr {
+            E::SstReader::open_encrypted(&path, mgr)?
+        } else {
+            E::SstReader::open(&path)?
+        };
+
         if let Err(e) = sst_reader.verify_checksum() {
             // use sst reader to verify block checksum, it would detect corrupted SST due to
             // memory bit-flip
@@ -199,28 +180,10 @@ where
             return Err(io::Error::new(io::ErrorKind::InvalidData, e).into());
         }
         File::open(&path).and_then(|f| f.sync_all())?;
-        Ok(info.file_size())
+        Ok(())
     };
 
     let instant = Instant::now();
-    let _io_type_guard = WithIoType::new(if for_balance {
-        IoType::LoadBalance
-    } else {
-        IoType::Replication
-    });
-
-    let mut io_tracker = IoBytesTracker::new();
-    let mut next_io_check_size = stats.total_kv_size + SCAN_BYTES_PER_IO_LIMIT_CHECK;
-    let handle_read_io_usage = |io_tracker: &mut IoBytesTracker, remained_quota: &mut usize| {
-        if let Some(io_bytes_delta) = io_tracker.update() {
-            while io_bytes_delta.read as usize > *remained_quota {
-                io_limiter.blocking_consume(IO_LIMITER_CHUNK_SIZE);
-                *remained_quota += IO_LIMITER_CHUNK_SIZE;
-            }
-            *remained_quota -= io_bytes_delta.read as usize;
-        }
-    };
-
     box_try!(snap.scan(cf, start_key, end_key, false, |key, value| {
         let entry_len = key.len() + value.len();
         if file_length + entry_len > raw_size_per_file as usize {
@@ -238,9 +201,7 @@ where
             match result {
                 Ok(new_sst_writer) => {
                     let old_writer = sst_writer.replace(new_sst_writer);
-                    stats.total_sst_size +=
-                        box_try!(finish_sst_writer(old_writer, prev_path, key_mgr.clone()))
-                            as usize;
+                    box_try!(finish_sst_writer(old_writer, prev_path, key_mgr.clone()));
                 }
                 Err(e) => {
                     let io_error = io::Error::new(io::ErrorKind::Other, e);
@@ -249,16 +210,15 @@ where
             }
         }
 
-        stats.key_count += 1;
-        stats.total_kv_size += entry_len;
-
-        if stats.total_kv_size >= next_io_check_size {
-            // TODO(@hhwyt): Consider incorporating snapshot file write I/O into the
-            // limiting mechanism.
-            handle_read_io_usage(&mut io_tracker, &mut remained_quota);
-            next_io_check_size = stats.total_kv_size + SCAN_BYTES_PER_IO_LIMIT_CHECK;
+        while entry_len > remained_quota {
+            // It's possible to acquire more than necessary, but let it be.
+            io_limiter.blocking_consume(IO_LIMITER_CHUNK_SIZE);
+            remained_quota += IO_LIMITER_CHUNK_SIZE;
         }
+        remained_quota -= entry_len;
 
+        stats.key_count += 1;
+        stats.total_size += entry_len;
         if let Err(e) = sst_writer.borrow_mut().put(key, value) {
             let io_error = io::Error::new(io::ErrorKind::Other, e);
             return Err(io_error.into());
@@ -266,22 +226,15 @@ where
         file_length += entry_len;
         Ok(true)
     }));
-    // Handle the IO generated by the remaining key-value pairs less than
-    // SCAN_BYTES_PER_IO_LIMIT_CHECK.
-    handle_read_io_usage(&mut io_tracker, &mut remained_quota);
-    stats.total_io_size = io_tracker.get_total_io_bytes().read as usize;
-
     if stats.key_count > 0 {
-        stats.total_sst_size +=
-            box_try!(finish_sst_writer(sst_writer.into_inner(), path, key_mgr)) as usize;
+        box_try!(finish_sst_writer(sst_writer.into_inner(), path, key_mgr));
         cf_file.add_file(file_id);
         info!(
-            "build_sst_cf_file_list builds {} files in cf {}. Total keys {}, total kv size {}, total sst size {}. raw_size_per_file {}, total takes {:?}",
+            "build_sst_cf_file_list builds {} files in cf {}. Total keys {}, total size {}. raw_size_per_file {}, total takes {:?}",
             file_id + 1,
             cf,
             stats.key_count,
-            stats.total_kv_size,
-            stats.total_sst_size,
+            stats.total_size,
             raw_size_per_file,
             instant.saturating_elapsed(),
         );
@@ -293,9 +246,6 @@ where
 
 /// Apply the given snapshot file into a column family. `callback` will be
 /// invoked after each batch of key value pairs written to db.
-///
-/// Attention, callers should manually flush and sync the column family after
-/// applying all sst files to make sure the data durability.
 pub fn apply_plain_cf_file<E, F>(
     path: &str,
     key_mgr: Option<&Arc<DataKeyManager>>,
@@ -411,7 +361,11 @@ where
     E: KvEngine,
     F: for<'r> FnMut(&'r [(Vec<u8>, Vec<u8>)]),
 {
-    let sst_reader = E::SstReader::open(path, key_mgr)?;
+    let sst_reader = if let Some(mgr) = key_mgr {
+        E::SstReader::open_encrypted(path, mgr)?
+    } else {
+        E::SstReader::open(path)?
+    };
     let mut iter = sst_reader.iter(IterOptions::default())?;
     iter.seek_to_first()?;
 
@@ -452,12 +406,6 @@ where
     Ok(())
 }
 
-/// Apply the given snapshot file into a column family by directly writing kv
-/// pairs to db, without ingesting them. `callback` will be invoked after each
-/// batch of key value pairs written to db.
-///
-/// Attention, callers should manually flush and sync the column family after
-/// applying all sst files to make sure the data durability.
 pub fn apply_sst_cf_files_without_ingest<E, F>(
     files: &[&str],
     db: &E,
@@ -503,7 +451,7 @@ pub fn get_decrypter_reader(
     encryption_key_manager: &DataKeyManager,
 ) -> Result<Box<dyn Read + Send>, Error> {
     let enc_info = box_try!(encryption_key_manager.get_file(file));
-    let mthd = enc_info.method;
+    let mthd = from_engine_encryption_method(enc_info.method);
     debug!(
         "get_decrypter_reader gets enc_info for {:?}, method: {:?}",
         file, mthd
@@ -543,7 +491,7 @@ mod tests {
         for db_creater in db_creaters {
             let (_enc_dir, enc_opts) =
                 gen_db_options_with_encryption("test_cf_build_and_apply_plain_files_enc");
-            for db_opt in [None, Some(enc_opts)] {
+            for db_opt in vec![None, Some(enc_opts)] {
                 let dir = Builder::new().prefix("test-snap-cf-db").tempdir().unwrap();
                 let db: KvTestEngine = db_creater(dir.path(), db_opt.clone(), None).unwrap();
                 // Collect keys via the key_callback into a collection.
@@ -632,7 +580,7 @@ mod tests {
             for db_creater in db_creaters {
                 let (_enc_dir, enc_opts) =
                     gen_db_options_with_encryption("test_cf_build_and_apply_sst_files_enc");
-                for db_opt in [None, Some(enc_opts)] {
+                for db_opt in vec![None, Some(enc_opts)] {
                     let dir = Builder::new().prefix("test-snap-cf-db").tempdir().unwrap();
                     let db = db_creater(dir.path(), db_opt.clone(), None).unwrap();
                     let snap_cf_dir = Builder::new().prefix("test-snap-cf").tempdir().unwrap();
@@ -652,7 +600,6 @@ mod tests {
                         *max_file_size,
                         &limiter,
                         db_opt.as_ref().and_then(|opt| opt.get_key_manager()),
-                        true,
                     )
                     .unwrap();
                     if stats.key_count == 0 {
@@ -689,55 +636,5 @@ mod tests {
                 }
             }
         }
-    }
-
-    // This test verifies that building SST files is effectively limited by the I/O
-    // limiter based on actual I/O usage. It achieve this by adding an I/O limiter
-    // and asserting that the elapsed time for building SST files exceeds the
-    // lower bound enforced by the I/O limiter.
-    //
-    // In this test, the I/O limiter is configured with a throughput limit 8000
-    // bytes/sec. A dataset of 1000 keys (totaling 11, 890 bytes) is generated  to
-    // trigger two I/O limiter checks, as the default SCAN_BYTES_PER_IO_LIMIT_CHECK
-    // is 8192 bytes. During each check, the mocked `get_thread_io_bytes_stats`
-    // function returns 4096 bytes of I/O usage, resulting in total of 8192 bytes.
-    // With the 8000 bytes/sec limitation, we assert that the elapsed time must
-    // exceed 1 second.
-    #[cfg(feature = "failpoints")]
-    #[test]
-    fn test_build_sst_with_io_limiter() {
-        let dir = Builder::new().prefix("test-io-limiter").tempdir().unwrap();
-        let db = open_test_db_with_nkeys(dir.path(), None, None, 1000).unwrap();
-        // The max throughput is 8000 bytes/sec.
-        let bytes_per_sec = 8000_f64;
-        let limiter = Limiter::new(bytes_per_sec);
-        let snap_dir = Builder::new().prefix("snap-dir").tempdir().unwrap();
-        let mut cf_file = CfFile {
-            cf: CF_DEFAULT,
-            path: PathBuf::from(snap_dir.path()),
-            file_prefix: "test_sst".to_string(),
-            file_suffix: SST_FILE_SUFFIX.to_string(),
-            ..Default::default()
-        };
-
-        let start = Instant::now();
-        fail::cfg("delta_read_io_bytes", "return(4096)").unwrap();
-        let stats = build_sst_cf_file_list::<KvTestEngine>(
-            &mut cf_file,
-            &db,
-            &db.snapshot(),
-            &keys::data_key(b""),
-            &keys::data_key(b"z"),
-            u64::MAX,
-            &limiter,
-            None,
-            true,
-        )
-        .unwrap();
-        // 8192 represents the mocked total I/O bytes.
-        assert_eq!(stats.total_io_size, 8192);
-        assert_eq!(stats.total_kv_size, 11890);
-        // Must exceed 1 second!
-        assert!(start.saturating_elapsed_secs() > 1_f64);
     }
 }

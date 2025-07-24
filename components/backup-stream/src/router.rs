@@ -13,19 +13,15 @@ use std::{
     time::Duration,
 };
 
-use dashmap::DashMap;
-use encryption::{BackupEncryptionManager, EncrypterReader, Iv, MultiMasterKeyBackend};
-use encryption_export::create_async_backend;
 use engine_traits::{CfName, CF_DEFAULT, CF_LOCK, CF_WRITE};
-use external_storage::{create_storage, BackendConfig, ExternalStorage, UnpinReader};
-use file_system::Sha256Reader;
+use external_storage::{BackendConfig, UnpinReader};
+use external_storage_export::{create_storage, ExternalStorage};
 use futures::io::Cursor;
 use kvproto::{
     brpb::{
         CompressionType, DataFileGroup, DataFileInfo, FileType, MetaVersion, Metadata,
-        StreamBackupTaskInfo, StreamBackupTaskSecurityConfig_oneof_encryption,
+        StreamBackupTaskInfo,
     },
-    encryptionpb::{EncryptionMethod, FileEncryptionInfo, MasterKeyBased, PlainTextDataKey},
     metapb::RegionEpoch,
     raft_cmdpb::CmdType,
 };
@@ -49,9 +45,7 @@ use tokio::{
     io::AsyncWriteExt,
     sync::{Mutex, RwLock},
 };
-use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
-use tracing::instrument;
-use tracing_active_tree::frame;
+use tokio_util::compat::TokioAsyncReadCompatExt;
 use txn_types::{Key, Lock, TimeStamp, WriteRef};
 
 use super::errors::Result;
@@ -63,25 +57,19 @@ use crate::{
     metrics::{HANDLE_KV_HISTOGRAM, SKIP_KV_COUNTER},
     subscription_manager::ResolvedRegions,
     subscription_track::TwoPhaseResolver,
-    tempfiles::{self, ForRead, TempFilePool},
+    tempfiles::{self, TempFilePool},
     try_send,
     utils::{self, CompressionWriter, FilesReader, SegmentMap, SlotMap, StopWatch},
 };
 
 const FLUSH_FAILURE_BECOME_FATAL_THRESHOLD: usize = 30;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum TaskSelector {
     ByName(String),
     ByKey(Vec<u8>),
     ByRange(Vec<u8>, Vec<u8>),
     All,
-}
-
-impl std::fmt::Debug for TaskSelector {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.reference().fmt(f)
-    }
 }
 
 impl TaskSelector {
@@ -95,30 +83,12 @@ impl TaskSelector {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum TaskSelectorRef<'a> {
     ByName(&'a str),
     ByKey(&'a [u8]),
     ByRange(&'a [u8], &'a [u8]),
     All,
-}
-
-impl<'a> std::fmt::Debug for TaskSelectorRef<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ByName(name) => f.debug_tuple("ByName").field(name).finish(),
-            Self::ByKey(key) => f
-                .debug_tuple("ByKey")
-                .field(&format_args!("{}", utils::redact(key)))
-                .finish(),
-            Self::ByRange(start, end) => f
-                .debug_tuple("ByRange")
-                .field(&format_args!("{}", utils::redact(start)))
-                .field(&format_args!("{}", utils::redact(end)))
-                .finish(),
-            Self::All => write!(f, "All"),
-        }
-    }
 }
 
 impl<'a> TaskSelectorRef<'a> {
@@ -138,7 +108,7 @@ impl<'a> TaskSelectorRef<'a> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ApplyEvent {
     pub key: Vec<u8>,
     pub value: Vec<u8>,
@@ -146,7 +116,7 @@ pub struct ApplyEvent {
     pub cmd_type: CmdType,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ApplyEvents {
     events: Vec<ApplyEvent>,
     region_id: u64,
@@ -160,7 +130,6 @@ pub struct FlushContext<'a> {
     pub store_id: u64,
     pub resolved_regions: &'a ResolvedRegions,
     pub resolved_ts: TimeStamp,
-    pub flush_ts: TimeStamp,
 }
 
 impl ApplyEvents {
@@ -169,7 +138,7 @@ impl ApplyEvents {
     /// those keys.
     /// Note: the resolved ts cannot be advanced if there is no command, maybe
     /// we also need to update resolved_ts when flushing?
-    pub fn from_cmd_batch(cmd: CmdBatch, resolver: &mut TwoPhaseResolver) -> Result<Self> {
+    pub fn from_cmd_batch(cmd: CmdBatch, resolver: &mut TwoPhaseResolver) -> Self {
         let region_id = cmd.region_id;
         let mut result = vec![];
         for req in cmd
@@ -213,9 +182,7 @@ impl ApplyEvents {
                         }) {
                             Ok(lock) => {
                                 if utils::should_track_lock(&lock) {
-                                    resolver
-                                        .track_lock(lock.ts, key, lock.generation)
-                                        .map_err(|_| Error::OutOfQuota { region_id })?;
+                                    resolver.track_lock(lock.ts, key)
                                 }
                             }
                             Err(err) => err.report(format!("region id = {}", region_id)),
@@ -238,11 +205,11 @@ impl ApplyEvents {
             }
             result.push(item);
         }
-        Ok(Self {
+        Self {
             events: result,
             region_id,
             region_resolved_ts: resolver.resolved_ts().into_inner(),
-        })
+        }
     }
 
     pub fn push(&mut self, event: ApplyEvent) {
@@ -334,7 +301,7 @@ impl ApplyEvent {
 
 /// The shared version of router.
 #[derive(Debug, Clone)]
-pub struct Router(pub(crate) Arc<RouterInner>);
+pub struct Router(Arc<RouterInner>);
 
 pub struct Config {
     pub prefix: PathBuf,
@@ -343,8 +310,8 @@ pub struct Config {
     pub max_flush_interval: Duration,
 }
 
-impl From<BackupStreamConfig> for Config {
-    fn from(value: BackupStreamConfig) -> Self {
+impl From<tikv::config::BackupStreamConfig> for Config {
+    fn from(value: tikv::config::BackupStreamConfig) -> Self {
         let prefix = PathBuf::from(value.temp_path);
         let temp_file_size_limit = value.file_size_limit.0;
         let temp_file_memory_quota = value.temp_file_memory_quota.0;
@@ -360,16 +327,8 @@ impl From<BackupStreamConfig> for Config {
 
 impl Router {
     /// Create a new router with the temporary folder.
-    pub fn new(
-        scheduler: Scheduler<Task>,
-        config: Config,
-        backup_encryption_manager: BackupEncryptionManager,
-    ) -> Self {
-        Self(Arc::new(RouterInner::new(
-            scheduler,
-            config,
-            backup_encryption_manager,
-        )))
+    pub fn new(scheduler: Scheduler<Task>, config: Config) -> Self {
+        Self(Arc::new(RouterInner::new(scheduler, config)))
     }
 }
 
@@ -396,7 +355,7 @@ pub struct RouterInner {
     /// which range a point belongs to.
     ranges: SyncRwLock<SegmentMap<Vec<u8>, String>>,
     /// The temporary files associated to some task.
-    tasks: DashMap<String, Arc<StreamTaskHandler>>,
+    tasks: Mutex<HashMap<String, Arc<StreamTaskInfo>>>,
     /// The temporary directory for all tasks.
     prefix: PathBuf,
 
@@ -408,9 +367,6 @@ pub struct RouterInner {
     temp_file_memory_quota: AtomicU64,
     /// The max duration the local data can be pending.
     max_flush_interval: SyncRwLock<Duration>,
-
-    /// Backup encryption manager
-    backup_encryption_manager: BackupEncryptionManager,
 }
 
 impl std::fmt::Debug for RouterInner {
@@ -424,32 +380,27 @@ impl std::fmt::Debug for RouterInner {
 }
 
 impl RouterInner {
-    pub fn new(
-        scheduler: Scheduler<Task>,
-        config: Config,
-        backup_encryption_manager: BackupEncryptionManager,
-    ) -> Self {
+    pub fn new(scheduler: Scheduler<Task>, config: Config) -> Self {
         RouterInner {
             ranges: SyncRwLock::new(SegmentMap::default()),
-            tasks: DashMap::new(),
+            tasks: Mutex::new(HashMap::default()),
             prefix: config.prefix,
             scheduler,
             temp_file_size_limit: AtomicU64::new(config.temp_file_size_limit),
             temp_file_memory_quota: AtomicU64::new(config.temp_file_memory_quota),
             max_flush_interval: SyncRwLock::new(config.max_flush_interval),
-            backup_encryption_manager,
         }
     }
 
-    pub fn update_config(&self, config: &BackupStreamConfig) {
+    pub fn udpate_config(&self, config: &BackupStreamConfig) {
         *self.max_flush_interval.write().unwrap() = config.max_flush_interval.0;
         self.temp_file_size_limit
             .store(config.file_size_limit.0, Ordering::SeqCst);
         self.temp_file_memory_quota
             .store(config.temp_file_memory_quota.0, Ordering::SeqCst);
-        for entry in self.tasks.iter() {
-            entry
-                .temp_file_pool
+        let tasks = self.tasks.blocking_lock();
+        for task in tasks.values() {
+            task.temp_file_pool
                 .config()
                 .cache_size
                 .store(config.temp_file_memory_quota.0 as usize, Ordering::SeqCst);
@@ -506,85 +457,20 @@ impl RouterInner {
         merged_file_size_limit: u64,
     ) -> Result<()> {
         let task_name = task.info.get_name().to_owned();
+
         // register task info
         let cfg = self.tempfile_config_for_task(&task);
-        let backup_encryption_manager =
-            self.build_backup_encryption_manager_for_task(&task).await?;
-        let stream_task = StreamTaskHandler::new(
-            task,
-            ranges.clone(),
-            merged_file_size_limit,
-            cfg,
-            backup_encryption_manager,
-        )
-        .await?;
-        self.tasks.insert(task_name.clone(), Arc::new(stream_task));
+        let stream_task =
+            StreamTaskInfo::new(task, ranges.clone(), merged_file_size_limit, cfg).await?;
+        self.tasks
+            .lock()
+            .await
+            .insert(task_name.clone(), Arc::new(stream_task));
 
-        // register ranges
+        // register ragnes
         self.register_ranges(&task_name, ranges);
 
         Ok(())
-    }
-
-    async fn build_backup_encryption_manager_for_task(
-        &self,
-        task: &StreamTask,
-    ) -> Result<BackupEncryptionManager> {
-        if let Some(config) = task.info.security_config.as_ref() {
-            if let Some(encryption) = config.encryption.as_ref() {
-                match encryption {
-                    StreamBackupTaskSecurityConfig_oneof_encryption::PlaintextDataKey(key) => {
-                        // sanity check key is valid
-                        let opt_key = if !key.cipher_key.is_empty()
-                            && (key.cipher_type != EncryptionMethod::Plaintext
-                                && key.cipher_type != EncryptionMethod::Unknown)
-                        {
-                            Some(key.clone())
-                        } else {
-                            None
-                        };
-                        Ok(BackupEncryptionManager::new(
-                            opt_key,
-                            self.backup_encryption_manager
-                                .master_key_based_file_encryption_method,
-                            self.backup_encryption_manager
-                                .multi_master_key_backend
-                                .clone(),
-                            self.backup_encryption_manager.tikv_data_key_manager.clone(),
-                        ))
-                    }
-                    StreamBackupTaskSecurityConfig_oneof_encryption::MasterKeyConfig(config) => {
-                        let multi_master_key_backend = if !config.master_keys.is_empty() {
-                            let multi_master_key_backend = MultiMasterKeyBackend::new();
-                            multi_master_key_backend
-                                .update_from_proto_if_needed(
-                                    config.master_keys.to_vec(),
-                                    create_async_backend,
-                                )
-                                .await?;
-                            multi_master_key_backend
-                        } else {
-                            error!(
-                                "receive master key config but does not find master key inside, fall back to default"
-                            );
-                            self.backup_encryption_manager
-                                .multi_master_key_backend
-                                .clone()
-                        };
-                        Ok(BackupEncryptionManager::new(
-                            None,
-                            config.encryption_type,
-                            multi_master_key_backend,
-                            self.backup_encryption_manager.tikv_data_key_manager.clone(),
-                        ))
-                    }
-                }
-            } else {
-                Ok(self.backup_encryption_manager.clone())
-            }
-        } else {
-            Ok(self.backup_encryption_manager.clone())
-        }
     }
 
     fn tempfile_config_for_task(&self, task: &StreamTask) -> tempfiles::Config {
@@ -603,14 +489,14 @@ impl RouterInner {
         }
     }
 
-    pub fn unregister_task(&self, task_name: &str) -> Option<StreamBackupTaskInfo> {
-        self.tasks.remove(task_name).map(|t| {
+    pub async fn unregister_task(&self, task_name: &str) -> Option<StreamBackupTaskInfo> {
+        self.tasks.lock().await.remove(task_name).map(|t| {
             info!(
                 "backup stream unregister task";
                 "task" => task_name,
             );
             self.unregister_ranges(task_name);
-            t.1.task.info.clone()
+            t.task.info.clone()
         })
     }
 
@@ -620,11 +506,10 @@ impl RouterInner {
         r.get_value_by_point(key).cloned()
     }
 
-    pub fn select_task(&self, selector: TaskSelectorRef<'_>) -> Vec<String> {
-        self.tasks
-            .iter()
-            .filter(|entry| {
-                let (name, info) = entry.pair();
+    pub async fn select_task(&self, selector: TaskSelectorRef<'_>) -> Vec<String> {
+        let s = self.tasks.lock().await;
+        s.iter()
+            .filter(|(name, info)| {
                 selector.matches(
                     name.as_str(),
                     info.ranges
@@ -632,24 +517,24 @@ impl RouterInner {
                         .map(|(s, e)| (s.as_slice(), e.as_slice())),
                 )
             })
-            .map(|entry| entry.key().to_owned())
+            .map(|(name, _)| name.to_owned())
             .collect()
     }
 
     #[cfg(test)]
-    pub(crate) fn must_mut_task_info<F>(&self, task_name: &str, mutator: F)
+    pub(crate) async fn must_mut_task_info<F>(&self, task_name: &str, mutator: F)
     where
-        F: FnOnce(&mut StreamTaskHandler),
+        F: FnOnce(&mut StreamTaskInfo),
     {
-        let t = self.tasks.remove(task_name);
-        let mut raw = Arc::try_unwrap(t.unwrap().1).unwrap();
+        let mut tasks = self.tasks.lock().await;
+        let t = tasks.remove(task_name);
+        let mut raw = Arc::try_unwrap(t.unwrap()).unwrap();
         mutator(&mut raw);
-        self.tasks.insert(task_name.to_owned(), Arc::new(raw));
+        tasks.insert(task_name.to_owned(), Arc::new(raw));
     }
 
-    #[instrument(skip(self))]
-    pub fn get_task_handler(&self, task_name: &str) -> Result<Arc<StreamTaskHandler>> {
-        let task_handler = match self.tasks.get(task_name) {
+    pub async fn get_task_info(&self, task_name: &str) -> Result<Arc<StreamTaskInfo>> {
+        let task_info = match self.tasks.lock().await.get(task_name) {
             Some(t) => t.clone(),
             None => {
                 info!("backup stream no task"; "task" => ?task_name);
@@ -658,14 +543,22 @@ impl RouterInner {
                 });
             }
         };
-        Ok(task_handler)
+        Ok(task_info)
     }
 
-    #[instrument(skip_all, fields(task))]
-    async fn on_events_by_task(&self, task: String, events: ApplyEvents) -> Result<()> {
-        let task_handler = self.get_task_handler(&task)?;
-        task_handler.on_events(events).await?;
+    async fn on_event(&self, task: String, events: ApplyEvents) -> Result<()> {
+        let task_info = self.get_task_info(&task).await?;
+        task_info.on_events(events).await?;
         let file_size_limit = self.temp_file_size_limit.load(Ordering::SeqCst);
+        #[cfg(features = "failpoints")]
+        {
+            let delayed = (|| {
+                fail::fail_point!("router_on_event_delay_ms", |v| {
+                    v.and_then(|v| v.parse::<u64>().ok()).unwrap_or(0)
+                })
+            })();
+            tokio::time::sleep(Duration::from_millis(delayed)).await;
+        }
 
         // When this event make the size of temporary files exceeds the size limit, make
         // a flush. Note that we only flush if the size is less than the limit before
@@ -673,16 +566,16 @@ impl RouterInner {
         debug!(
             "backup stream statics size";
             "task" => ?task,
-            "next_size" => task_handler.total_size(),
+            "next_size" => task_info.total_size(),
             "size_limit" => file_size_limit,
         );
-        let cur_size = task_handler.total_size();
-        if cur_size > file_size_limit && !task_handler.is_flushing() {
+        let cur_size = task_info.total_size();
+        if cur_size > file_size_limit && !task_info.is_flushing() {
             info!("try flushing task"; "task" => %task, "size" => %cur_size);
-            if task_handler.set_flushing_status_cas(false, true).is_ok() {
+            if task_info.set_flushing_status_cas(false, true).is_ok() {
                 if let Err(e) = self.scheduler.schedule(Task::Flush(task)) {
                     error!("backup stream schedule task failed"; "error" => ?e);
-                    task_handler.set_flushing_status(false);
+                    task_info.set_flushing_status(false);
                 }
             }
         }
@@ -693,18 +586,17 @@ impl RouterInner {
         use futures::FutureExt;
         HANDLE_KV_HISTOGRAM.observe(kv.len() as _);
         let partitioned_events = kv.partition_by_range(&self.ranges.rl());
-        let tasks = partitioned_events.into_iter().map(|(task, events)| {
-            self.on_events_by_task(task.clone(), events)
-                .map(move |r| (task, r))
-        });
+        let tasks = partitioned_events
+            .into_iter()
+            .map(|(task, events)| self.on_event(task.clone(), events).map(move |r| (task, r)));
         futures::future::join_all(tasks).await
     }
 
-    /// flush the specified task, once success, return the min resolved ts
+    /// flush the specified task, once once success, return the min resolved ts
     /// of this flush. returns `None` if failed.
-    #[instrument(skip(self, cx))]
     pub async fn do_flush(&self, cx: FlushContext<'_>) -> Option<u64> {
-        let task = self.tasks.get(cx.task_name);
+        let task = self.tasks.lock().await.get(cx.task_name).cloned();
+
         match task {
             Some(task_handler) => {
                 let result = task_handler.do_flush(cx).await;
@@ -734,26 +626,23 @@ impl RouterInner {
         }
     }
 
-    #[instrument(skip(self))]
     pub async fn update_global_checkpoint(
         &self,
         task_name: &str,
         global_checkpoint: u64,
         store_id: u64,
     ) -> Result<bool> {
-        self.get_task_handler(task_name)?
+        self.get_task_info(task_name)
+            .await?
             .update_global_checkpoint(global_checkpoint, store_id)
             .await
     }
 
     /// tick aims to flush log/meta to extern storage periodically.
-    #[instrument(skip_all)]
     pub async fn tick(&self) {
         let max_flush_interval = self.max_flush_interval.rl().to_owned();
 
-        for entry in self.tasks.iter() {
-            let name = entry.key();
-            let task_info = entry.value();
+        for (name, task_info) in self.tasks.lock().await.iter() {
             if let Err(e) = self
                 .scheduler
                 .schedule(Task::UpdateGlobalCheckpoint(name.to_string()))
@@ -913,18 +802,12 @@ impl TempFileKey {
     }
 }
 
-/// StreamTaskHandler acts on the events for the backup stream task.
-/// It writes the key value pair changes from raft store to local temp files and
-/// flushes it to the external storage.
-pub struct StreamTaskHandler {
+pub struct StreamTaskInfo {
     pub(crate) task: StreamTask,
     /// support external storage. eg local/s3.
     pub(crate) storage: Arc<dyn ExternalStorage>,
     /// The listening range of the task.
     ranges: Vec<(Vec<u8>, Vec<u8>)>,
-    // Note: acquiring locks on files, flushing_files, flushing_meta_files at the same time might
-    // introduce deadlocks if ordering is not carefully maintained. Better think of another way
-    // to make it risk-free.
     /// The temporary file index. Both meta (m prefixed keys) and data (t
     /// prefixed keys).
     files: SlotMap<TempFileKey, DataFile>,
@@ -953,12 +836,9 @@ pub struct StreamTaskHandler {
     merged_file_size_limit: u64,
     /// The pool for holding the temporary files.
     temp_file_pool: Arc<TempFilePool>,
-    /// encryption manager to encrypt backup files uploaded
-    /// to external storage and local temp files.
-    backup_encryption_manager: BackupEncryptionManager,
 }
 
-impl Drop for StreamTaskHandler {
+impl Drop for StreamTaskInfo {
     fn drop(&mut self) {
         let (success, failed): (Vec<_>, Vec<_>) = self
             .flushing_files
@@ -968,7 +848,7 @@ impl Drop for StreamTaskHandler {
             .map(|(_, f, _)| f.inner.path().to_owned())
             .map(|p| self.temp_file_pool.remove(&p))
             .partition(|r| *r);
-        info!("stream task handler dropped[1/2], removing flushing_temp files"; "success" => %success.len(), "failure" => %failed.len());
+        info!("stream task info dropped[1/2], removing flushing_temp files"; "success" => %success.len(), "failure" => %failed.len());
         let (success, failed): (Vec<_>, Vec<_>) = self
             .files
             .get_mut()
@@ -976,13 +856,13 @@ impl Drop for StreamTaskHandler {
             .map(|(_, f)| f.into_inner().inner.path().to_owned())
             .map(|p| self.temp_file_pool.remove(&p))
             .partition(|r| *r);
-        info!("stream task handler dropped[2/2], removing temp files"; "success" => %success.len(), "failure" => %failed.len());
+        info!("stream task info dropped[2/2], removing temp files"; "success" => %success.len(), "failure" => %failed.len());
     }
 }
 
-impl std::fmt::Debug for StreamTaskHandler {
+impl std::fmt::Debug for StreamTaskInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StreamTaskHandler")
+        f.debug_struct("StreamTaskInfo")
             .field("task", &self.task.info.name)
             .field("min_resolved_ts", &self.min_resolved_ts)
             .field("total_size", &self.total_size)
@@ -991,14 +871,13 @@ impl std::fmt::Debug for StreamTaskHandler {
     }
 }
 
-impl StreamTaskHandler {
+impl StreamTaskInfo {
     /// Create a new temporary file set at the `temp_dir`.
     pub async fn new(
         task: StreamTask,
         ranges: Vec<(Vec<u8>, Vec<u8>)>,
         merged_file_size_limit: u64,
         temp_pool_cfg: tempfiles::Config,
-        backup_encryption_manager: BackupEncryptionManager,
     ) -> Result<Self> {
         let temp_dir = &temp_pool_cfg.swap_files;
         tokio::fs::create_dir_all(temp_dir).await?;
@@ -1021,56 +900,20 @@ impl StreamTaskHandler {
             flush_fail_count: AtomicUsize::new(0),
             global_checkpoint_ts: AtomicU64::new(start_ts),
             merged_file_size_limit,
-            temp_file_pool: Arc::new(TempFilePool::new(
-                temp_pool_cfg,
-                backup_encryption_manager.clone(),
-            )?),
-            backup_encryption_manager,
+            temp_file_pool: Arc::new(TempFilePool::new(temp_pool_cfg)?),
         })
     }
 
-    #[cfg(test)]
-    pub fn new_test_only(
-        task: StreamTask,
-        ranges: Vec<(Vec<u8>, Vec<u8>)>,
-        merged_file_size_limit: u64,
-        external_storage: Arc<dyn ExternalStorage>,
-        pool: Arc<TempFilePool>,
-        backup_encryption_manager: BackupEncryptionManager,
-    ) -> Result<Self> {
-        let start_ts = task.info.get_start_ts();
-        Ok(Self {
-            task,
-            storage: external_storage,
-            ranges,
-            min_resolved_ts: TimeStamp::max(),
-            files: SlotMap::default(),
-            flushing_files: RwLock::default(),
-            flushing_meta_files: RwLock::default(),
-            last_flush_time: AtomicPtr::new(Box::into_raw(Box::new(Instant::now()))),
-            total_size: AtomicUsize::new(0),
-            flushing: AtomicBool::new(false),
-            flush_fail_count: AtomicUsize::new(0),
-            global_checkpoint_ts: AtomicU64::new(start_ts),
-            merged_file_size_limit,
-            temp_file_pool: pool,
-            backup_encryption_manager,
-        })
-    }
-
-    #[instrument(skip(self, events), fields(event_len = events.len()))]
     async fn on_events_of_key(&self, key: TempFileKey, events: ApplyEvents) -> Result<()> {
         fail::fail_point!("before_generate_temp_file");
-        if let Some(f) = frame!(self.files.read()).await.get(&key) {
-            self.total_size.fetch_add(
-                frame!(f.lock()).await.on_events(events).await?,
-                Ordering::SeqCst,
-            );
+        if let Some(f) = self.files.read().await.get(&key) {
+            self.total_size
+                .fetch_add(f.lock().await.on_events(events).await?, Ordering::SeqCst);
             return Ok(());
         }
 
         // slow path: try to insert the element.
-        let mut w = frame!(self.files.write()).await;
+        let mut w = self.files.write().await;
         // double check before insert. there may be someone already insert that
         // when we are waiting for the write lock.
         // silence the lint advising us to use the `Entry` API which may introduce
@@ -1078,22 +921,19 @@ impl StreamTaskHandler {
         #[allow(clippy::map_entry)]
         if !w.contains_key(&key) {
             let path = key.temp_file_name();
-            let val = Mutex::new(DataFile::new(path, &self.temp_file_pool)?);
+            let val = Mutex::new(DataFile::new(path, &self.temp_file_pool).await?);
             w.insert(key, val);
         }
 
         let f = w.get(&key).unwrap();
-        self.total_size.fetch_add(
-            frame!(f.lock()).await.on_events(events).await?,
-            Ordering::SeqCst,
-        );
+        self.total_size
+            .fetch_add(f.lock().await.on_events(events).await?, Ordering::SeqCst);
         fail::fail_point!("after_write_to_file");
         Ok(())
     }
 
     /// Append a event to the files. This wouldn't trigger `fsync` syscall.
     /// i.e. No guarantee of persistence.
-    #[instrument(skip_all)]
     pub async fn on_events(&self, kv: ApplyEvents) -> Result<()> {
         use futures::FutureExt;
         let now = Instant::now_coarse();
@@ -1119,8 +959,7 @@ impl StreamTaskHandler {
     }
 
     /// Flush all template files and generate corresponding metadata.
-    #[instrument(skip_all)]
-    pub async fn generate_backup_metadata(&self, store_id: u64) -> Result<MetadataInfo> {
+    pub async fn generate_metadata(&self, store_id: u64) -> Result<MetadataInfo> {
         let mut w = self.flushing_files.write().await;
         let mut wm = self.flushing_meta_files.write().await;
         // Let's flush all files first...
@@ -1184,9 +1023,7 @@ impl StreamTaskHandler {
             .last_flush_time
             .swap(Box::into_raw(Box::new(Instant::now())), Ordering::SeqCst);
         // manual gc last instant
-        unsafe {
-            let _ = Box::from_raw(ptr);
-        };
+        unsafe { Box::from_raw(ptr) };
     }
 
     pub fn should_flush(&self, flush_interval: &Duration) -> bool {
@@ -1201,7 +1038,6 @@ impl StreamTaskHandler {
     }
 
     /// move need-flushing files to flushing_files.
-    #[instrument(skip_all)]
     pub async fn move_to_flushing_files(&self) -> Result<&Self> {
         // if flushing_files is not empty, which represents this flush is a retry
         // operation.
@@ -1211,9 +1047,9 @@ impl StreamTaskHandler {
             return Ok(self);
         }
 
-        let mut w = frame!(self.files.write()).await;
-        let mut fw = frame!(self.flushing_files.write()).await;
-        let mut fw_meta = frame!(self.flushing_meta_files.write()).await;
+        let mut w = self.files.write().await;
+        let mut fw = self.flushing_files.write().await;
+        let mut fw_meta = self.flushing_meta_files.write().await;
         for (k, v) in w.drain() {
             // we should generate file metadata(calculate sha256) when moving file.
             // because sha256 calculation is a unsafe move operation.
@@ -1230,7 +1066,6 @@ impl StreamTaskHandler {
         Ok(self)
     }
 
-    #[instrument(skip_all)]
     pub async fn clear_flushing_files(&self) {
         for (_, data_file, _) in self.flushing_files.write().await.drain(..) {
             debug!("removing data file"; "size" => %data_file.file_size, "name" => %data_file.inner.path().display());
@@ -1250,12 +1085,12 @@ impl StreamTaskHandler {
         }
     }
 
-    #[instrument(skip_all)]
     async fn merge_and_flush_log_files_to(
-        &self,
+        storage: Arc<dyn ExternalStorage>,
         files: &mut [(TempFileKey, DataFile, DataFileInfo)],
         metadata: &mut MetadataInfo,
         is_meta: bool,
+        shared_pool: Arc<TempFilePool>,
     ) -> Result<()> {
         let mut data_files_open = Vec::new();
         let mut data_file_infos = Vec::new();
@@ -1270,19 +1105,16 @@ impl StreamTaskHandler {
             //  and push it into merged_file_info(DataFileGroup).
             file_info_clone.set_range_offset(stat_length);
             data_files_open.push({
-                // the file content is compressed.
-                let file_reader = self
-                    .temp_file_pool
+                let file = shared_pool
                     .open_raw_for_read(data_file.inner.path())
                     .context(format_args!(
                         "failed to open read file {:?}",
                         data_file.inner.path()
                     ))?;
-                let compress_length = file_reader.len().await?;
+                let compress_length = file.len().await?;
                 stat_length += compress_length;
                 file_info_clone.set_range_length(compress_length);
-
-                file_reader
+                file
             });
             data_file_infos.push(file_info_clone);
 
@@ -1304,17 +1136,16 @@ impl StreamTaskHandler {
         merged_file_info.set_max_ts(max_ts);
         merged_file_info.set_min_ts(min_ts);
         merged_file_info.set_min_resolved_ts(min_resolved_ts.unwrap_or_default());
-        let (unpin_reader, file_encryption_info_vec, hasher_vec) = self
-            .build_unpin_reader_with_encryption_if_needed(data_files_open)
-            .await?;
 
+        // to do: limiter to storage
+        let limiter = Limiter::builder(std::f64::INFINITY).build();
+
+        let files_reader = FilesReader::new(data_files_open);
+
+        let reader = UnpinReader(Box::new(limiter.limit(files_reader.compat())));
         let filepath = &merged_file_info.path;
 
-        // flush to external storage
-        let ret = self
-            .storage
-            .write(filepath, unpin_reader, stat_length)
-            .await;
+        let ret = storage.write(filepath, reader, stat_length).await;
 
         match ret {
             Ok(_) => {
@@ -1333,46 +1164,41 @@ impl StreamTaskHandler {
             }
         }
 
-        // update data file metadata with encryption info and calculated file checksum
-        self.update_data_file_metadata(
-            &mut merged_file_info,
-            hasher_vec,
-            file_encryption_info_vec,
-        )?;
-
         // push merged file into metadata
         metadata.push(merged_file_info);
         Ok(())
     }
 
-    #[instrument(skip_all)]
-    pub async fn flush_log(&self, backup_metadata: &mut MetadataInfo) -> Result<()> {
-        self.merge_and_flush_log(backup_metadata, &self.flushing_files, false)
+    pub async fn flush_log(&self, metadata: &mut MetadataInfo) -> Result<()> {
+        let storage = self.storage.clone();
+        self.merge_log(metadata, storage.clone(), &self.flushing_files, false)
             .await?;
-        self.merge_and_flush_log(backup_metadata, &self.flushing_meta_files, true)
+        self.merge_log(metadata, storage.clone(), &self.flushing_meta_files, true)
             .await?;
         Ok(())
     }
 
-    #[instrument(skip_all)]
-    async fn merge_and_flush_log(
+    async fn merge_log(
         &self,
         metadata: &mut MetadataInfo,
-        files: &RwLock<Vec<(TempFileKey, DataFile, DataFileInfo)>>,
-        is_tikv_meta_file: bool,
+        storage: Arc<dyn ExternalStorage>,
+        files_lock: &RwLock<Vec<(TempFileKey, DataFile, DataFileInfo)>>,
+        is_meta: bool,
     ) -> Result<()> {
-        let mut files_guard = files.write().await;
+        let mut files = files_lock.write().await;
         let mut batch_size = 0;
         // file[batch_begin_index, i) is a batch
         let mut batch_begin_index = 0;
         // TODO: upload the merged file concurrently,
         // then collect merged_file_infos and push them into `metadata`.
-        for i in 0..files_guard.len() {
+        for i in 0..files.len() {
             if batch_size >= self.merged_file_size_limit {
-                self.merge_and_flush_log_files_to(
-                    &mut files_guard[batch_begin_index..i],
+                Self::merge_and_flush_log_files_to(
+                    storage.clone(),
+                    &mut files[batch_begin_index..i],
                     metadata,
-                    is_tikv_meta_file,
+                    is_meta,
+                    self.temp_file_pool.clone(),
                 )
                 .await?;
 
@@ -1380,13 +1206,15 @@ impl StreamTaskHandler {
                 batch_size = 0;
             }
 
-            batch_size += files_guard[i].2.length;
+            batch_size += files[i].2.length;
         }
-        if batch_begin_index < files_guard.len() {
-            self.merge_and_flush_log_files_to(
-                &mut files_guard[batch_begin_index..],
+        if batch_begin_index < files.len() {
+            Self::merge_and_flush_log_files_to(
+                storage.clone(),
+                &mut files[batch_begin_index..],
                 metadata,
-                is_tikv_meta_file,
+                is_meta,
+                self.temp_file_pool.clone(),
             )
             .await?;
         }
@@ -1394,22 +1222,9 @@ impl StreamTaskHandler {
         Ok(())
     }
 
-    #[instrument(skip_all)]
-    pub async fn flush_backup_metadata(
-        &self,
-        metadata_info: MetadataInfo,
-        flush_ts: TimeStamp,
-    ) -> Result<()> {
+    pub async fn flush_meta(&self, metadata_info: MetadataInfo) -> Result<()> {
         if !metadata_info.file_groups.is_empty() {
-            let mut min_begin_ts = u64::MAX;
-            for file_group in metadata_info.file_groups.as_slice() {
-                assert!(!file_group.data_files_info.is_empty());
-                for d in file_group.data_files_info.as_slice() {
-                    assert_ne!(d.min_begin_ts_in_default_cf, 0);
-                    min_begin_ts = min_begin_ts.min(d.min_begin_ts_in_default_cf)
-                }
-            }
-            let meta_path = metadata_info.path_to_meta(min_begin_ts, flush_ts.into_inner());
+            let meta_path = metadata_info.path_to_meta();
             let meta_buff = metadata_info.marshal_to()?;
             let buflen = meta_buff.len();
 
@@ -1435,7 +1250,6 @@ impl StreamTaskHandler {
     /// The caller can try to advance the resolved ts and provide it to the
     /// function, and we would use `max(resolved_ts_provided,
     /// resolved_ts_from_file)`.
-    #[instrument(skip_all)]
     pub async fn do_flush(&self, cx: FlushContext<'_>) -> Result<Option<u64>> {
         // do nothing if not flushing status.
         let result: Result<Option<u64>> = async move {
@@ -1445,11 +1259,11 @@ impl StreamTaskHandler {
             let begin = Instant::now_coarse();
             let mut sw = StopWatch::by_now();
 
-            // generate backup meta data and prepare to flush to storage
-            let mut backup_metadata = self
+            // generate meta data and prepare to flush to storage
+            let mut metadata_info = self
                 .move_to_flushing_files()
                 .await?
-                .generate_backup_metadata(cx.store_id)
+                .generate_metadata(cx.store_id)
                 .await?;
 
             fail::fail_point!("after_moving_to_flushing_files");
@@ -1458,26 +1272,24 @@ impl StreamTaskHandler {
                 .observe(sw.lap().as_secs_f64());
 
             // flush log file to storage.
-            self.flush_log(&mut backup_metadata).await?;
+            self.flush_log(&mut metadata_info).await?;
             // the field `min_resolved_ts` of metadata will be updated
             // only after flush is done.
-            backup_metadata.min_resolved_ts = backup_metadata
+            metadata_info.min_resolved_ts = metadata_info
                 .min_resolved_ts
                 .max(Some(cx.resolved_ts.into_inner()));
-            let rts = backup_metadata.min_resolved_ts;
+            let rts = metadata_info.min_resolved_ts;
 
             // compress length
-            let file_size_vec = backup_metadata
+            let file_size_vec = metadata_info
                 .file_groups
                 .iter()
                 .map(|d| (d.length, d.data_files_info.len()))
                 .collect::<Vec<_>>();
-
             // flush meta file to storage.
-            self.fill_region_info(cx, &mut backup_metadata);
+            self.fill_region_info(cx, &mut metadata_info);
             // flush backup metadata to external storage.
-            self.flush_backup_metadata(backup_metadata, cx.flush_ts)
-                .await?;
+            self.flush_meta(metadata_info).await?;
             crate::metrics::FLUSH_DURATION
                 .with_label_values(&["save_files"])
                 .observe(sw.lap().as_secs_f64());
@@ -1525,7 +1337,6 @@ impl StreamTaskHandler {
         Ok(())
     }
 
-    #[instrument(skip_all)]
     pub async fn update_global_checkpoint(
         &self,
         global_checkpoint: u64,
@@ -1546,169 +1357,6 @@ impl StreamTaskHandler {
         }
         Ok(false)
     }
-
-    async fn build_unpin_reader_with_encryption_if_needed(
-        &self,
-        mut data_file_readers: Vec<ForRead>,
-    ) -> Result<(
-        UnpinReader<'_>,
-        Vec<FileEncryptionInfo>,
-        Vec<Arc<std::sync::Mutex<Hasher>>>,
-    )> {
-        // to do: limiter to storage
-        let limiter = Limiter::builder(f64::INFINITY).build();
-
-        // prioritize plaintext key passed from the user, it will override the default
-        // master key config if there is any
-        //
-        if let Some(cipher_info) = self.backup_encryption_manager.plaintext_data_key.as_ref() {
-            let mut encrypted_hashing_readers = Vec::new();
-            let mut hasher_vec = Vec::new();
-            let mut encryption_info_vec = Vec::new();
-
-            let data_key = &cipher_info.cipher_key;
-            for data_file_reader in data_file_readers.drain(..) {
-                let file_iv = Iv::new_ctr().map_err(|e| {
-                    Error::Other(box_err!(
-                        "failed to create IV for plaintext data key: {:?}",
-                        e
-                    ))
-                })?;
-                let encrypter_reader = EncrypterReader::new(
-                    data_file_reader.compat(),
-                    cipher_info.cipher_type,
-                    &data_key[..],
-                    file_iv,
-                )
-                .map_err(|e| {
-                    Error::Other(box_err!(
-                        "failed to create encrypted reader for plaintext data key: {:?}",
-                        e
-                    ))
-                })?;
-                let (sha256_reader, hasher) = Sha256Reader::new(encrypter_reader.compat())
-                    .map_err(|e| {
-                        Error::Other(box_err!(
-                            "failed to create sha256 reader for plaintext data key: {:?}",
-                            e
-                        ))
-                    })?;
-
-                let mut encryption_info = FileEncryptionInfo::new();
-                encryption_info.set_file_iv(file_iv.as_slice().to_vec());
-                encryption_info.set_encryption_method(cipher_info.cipher_type);
-                encryption_info.set_plain_text_data_key(PlainTextDataKey::new());
-
-                encryption_info_vec.push(encryption_info);
-                hasher_vec.push(hasher);
-                encrypted_hashing_readers.push(sha256_reader);
-            }
-
-            let files_reader = FilesReader::new(encrypted_hashing_readers);
-            let unpin_reader = UnpinReader(Box::new(limiter.limit(files_reader.compat())));
-            Ok((unpin_reader, encryption_info_vec, hasher_vec))
-        } else if self
-            .backup_encryption_manager
-            .is_master_key_backend_initialized()
-            .await
-        {
-            let mut encrypted_hashing_readers = Vec::new();
-            let mut hasher_vec = Vec::new();
-            let mut encryption_info_vec = Vec::new();
-
-            let data_key = self
-                .backup_encryption_manager
-                .generate_data_key()
-                .map_err(|e| Error::Other(box_err!("failed to generate data key: {:?}", e)))?;
-
-            let encrypted_data_key = self
-                .backup_encryption_manager
-                .encrypt_data_key(&data_key)
-                .await
-                .map_err(|e| Error::Other(box_err!("failed to encrypt data key: {:?}", e)))?;
-
-            // iterate data files readers and wrap with encryption + hashing
-            //
-            for data_file_reader in data_file_readers.drain(..) {
-                let file_iv = Iv::new_ctr().map_err(|e| {
-                    Error::Other(box_err!(
-                        "failed to create IV for master key based data key: {:?}",
-                        e
-                    ))
-                })?;
-                let encrypter_reader = EncrypterReader::new(
-                    data_file_reader.compat(),
-                    self.backup_encryption_manager
-                        .master_key_based_file_encryption_method,
-                    &data_key,
-                    file_iv,
-                )
-                .map_err(|e| {
-                    Error::Other(box_err!(
-                        "failed to create encrypted reader for master key based data key: {:?}",
-                        e
-                    ))
-                })?;
-                let (sha256_reader, hasher) = Sha256Reader::new(encrypter_reader.compat())
-                    .map_err(|e| {
-                        Error::Other(box_err!(
-                            "failed to create sha256 reader for master key based data key: {:?}",
-                            e
-                        ))
-                    })?;
-
-                let mut master_key_based_info = MasterKeyBased::new();
-                master_key_based_info
-                    .set_data_key_encrypted_content(vec![encrypted_data_key.clone()].into());
-
-                let mut encryption_info = FileEncryptionInfo::new();
-                encryption_info.set_master_key_based(master_key_based_info);
-                encryption_info.set_file_iv(file_iv.as_slice().to_vec());
-                encryption_info.set_encryption_method(
-                    self.backup_encryption_manager
-                        .master_key_based_file_encryption_method,
-                );
-
-                encryption_info_vec.push(encryption_info);
-                hasher_vec.push(hasher);
-                encrypted_hashing_readers.push(sha256_reader);
-            }
-
-            let files_reader = FilesReader::new(encrypted_hashing_readers);
-            let unpin_reader = UnpinReader(Box::new(limiter.limit(files_reader.compat())));
-            Ok((unpin_reader, encryption_info_vec, hasher_vec))
-        } else {
-            // no encryption
-            let files_reader = FilesReader::new(data_file_readers);
-            let unpin_reader = UnpinReader(Box::new(limiter.limit(files_reader.compat())));
-            Ok((unpin_reader, vec![], vec![]))
-        }
-    }
-
-    fn update_data_file_metadata(
-        &self,
-        data_file_meta: &mut DataFileGroup,
-        hasher_vec: Vec<Arc<std::sync::Mutex<Hasher>>>,
-        encryption_info_vec: Vec<FileEncryptionInfo>,
-    ) -> Result<()> {
-        // Iterate over the vectors and update the data_file_meta
-        for ((meta, hasher), mut encryption_info) in data_file_meta
-            .data_files_info
-            .iter_mut()
-            .zip(hasher_vec.into_iter())
-            .zip(encryption_info_vec.into_iter())
-        {
-            let checksum = hasher
-                .lock()
-                .unwrap()
-                .finish()
-                .map(|digest| digest.to_vec())
-                .map_err(|e| Error::Other(box_err!("calculate checksum error: {:?}", e)))?;
-            encryption_info.set_checksum(checksum);
-            meta.set_file_encryption_info(encryption_info);
-        }
-        Ok(())
-    }
 }
 
 /// A opened log file with some metadata.
@@ -1717,7 +1365,6 @@ struct DataFile {
     max_ts: TimeStamp,
     resolved_ts: TimeStamp,
     min_begin_ts: Option<TimeStamp>,
-    // checksum of plaintext kv file , calculated before compression
     sha256: Hasher,
     // TODO: use lz4 with async feature
     inner: tempfiles::ForWrite,
@@ -1734,7 +1381,6 @@ pub struct MetadataInfo {
     // the field files is deprecated in v6.3.0
     // pub files: Vec<DataFileInfo>,
     pub file_groups: Vec<DataFileGroup>,
-    // deprecated
     pub min_resolved_ts: Option<u64>,
     pub min_ts: Option<u64>,
     pub max_ts: Option<u64>,
@@ -1782,13 +1428,11 @@ impl MetadataInfo {
             .map_err(|err| Error::Other(box_err!("failed to marshal proto: {}", err)))
     }
 
-    fn path_to_meta(&self, min_begin_ts: u64, flush_ts: u64) -> String {
+    fn path_to_meta(&self) -> String {
         format!(
-            "v1/backupmeta/{:016X}-{:016X}-{:016X}-{:016X}.meta",
-            flush_ts,
-            min_begin_ts,
-            self.min_ts.unwrap_or_default(),
-            self.max_ts.unwrap_or_default(),
+            "v1/backupmeta/{}-{}.meta",
+            self.min_resolved_ts.unwrap_or_default(),
+            uuid::Uuid::new_v4()
         )
     }
 }
@@ -1796,7 +1440,7 @@ impl MetadataInfo {
 impl DataFile {
     /// create and open a logfile at the path.
     /// Note: if a file with same name exists, would truncate it.
-    fn new(local_path: impl AsRef<Path>, files: &Arc<TempFilePool>) -> Result<Self> {
+    async fn new(local_path: impl AsRef<Path>, files: &Arc<TempFilePool>) -> Result<Self> {
         let sha256 = Hasher::new(MessageDigest::sha256())
             .map_err(|err| Error::Other(box_err!("openssl hasher failed to init: {}", err)))?;
         let inner = files.open_for_write(local_path.as_ref())?;
@@ -1829,7 +1473,6 @@ impl DataFile {
     }
 
     /// Add a new KV pair to the file, returning its size.
-    #[instrument(skip_all)]
     async fn on_events(&mut self, events: ApplyEvents) -> Result<usize> {
         let now = Instant::now_coarse();
         let mut total_size = 0;
@@ -1932,7 +1575,6 @@ impl std::fmt::Debug for DataFile {
             .field("min_ts", &self.min_ts)
             .field("max_ts", &self.max_ts)
             .field("resolved_ts", &self.resolved_ts)
-            .field("file_size", &self.file_size)
             .finish()
     }
 }
@@ -1949,28 +1591,18 @@ struct TaskRange {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsStr, io, io::Cursor, time::Duration};
+    use std::{ffi::OsStr, io, time::Duration};
 
-    use async_compression::tokio::bufread::ZstdDecoder;
-    use encryption::{DecrypterReader, FileConfig, MasterKeyConfig, MultiMasterKeyBackend};
-    use external_storage::{BlobObject, ExternalData, NoopStorage};
-    use futures::{future::LocalBoxFuture, stream::LocalBoxStream, AsyncReadExt};
-    use kvproto::{
-        brpb::{CipherInfo, Noop, StorageBackend, StreamBackupTaskInfo},
-        encryptionpb::EncryptionMethod,
-    };
+    use external_storage::{ExternalData, NoopStorage};
+    use futures::AsyncReadExt;
+    use kvproto::brpb::{Local, Noop, StorageBackend, StreamBackupTaskInfo};
     use online_config::{ConfigManager, OnlineConfig};
-    use rand::Rng;
-    use tempfile::TempDir;
+    use tempdir::TempDir;
     use tikv_util::{
-        codec::{
-            number::NumberEncoder,
-            stream_event::{EventIterator, Iterator},
-        },
+        codec::number::NumberEncoder,
         config::ReadableDuration,
         worker::{dummy_scheduler, ReceiverWrapper},
     };
-    use tokio::{fs::File, io::BufReader};
     use txn_types::{Write, WriteType};
 
     use super::*;
@@ -2088,7 +1720,6 @@ mod tests {
                 temp_file_memory_quota: 1024 * 2,
                 max_flush_interval: Duration::from_secs(300),
             },
-            BackupEncryptionManager::default(),
         );
         // -----t1.start-----t1.end-----t2.start-----t2.end------
         // --|------------|----------|------------|-----------|--
@@ -2113,6 +1744,15 @@ mod tests {
         result
     }
 
+    fn create_local_storage_backend(path: String) -> StorageBackend {
+        let mut local = Local::default();
+        local.set_path(path);
+
+        let mut sb = StorageBackend::default();
+        sb.set_local(local);
+        sb
+    }
+
     fn create_noop_storage_backend() -> StorageBackend {
         let nop = Noop::new();
         let mut backend = StorageBackend::default();
@@ -2125,7 +1765,10 @@ mod tests {
         stream_task.set_name(name);
         let storage_path = std::env::temp_dir().join(format!("{}", uuid::Uuid::new_v4()));
         tokio::fs::create_dir_all(&storage_path).await?;
-        stream_task.set_storage(external_storage::make_local_backend(storage_path.as_path()));
+        println!("storage={:?}", storage_path);
+        stream_task.set_storage(create_local_storage_backend(
+            storage_path.to_str().unwrap().to_string(),
+        ));
         Ok((stream_task, storage_path))
     }
 
@@ -2187,7 +1830,6 @@ mod tests {
                 temp_file_memory_quota: 32 * 2,
                 max_flush_interval: Duration::from_secs(300),
             },
-            BackupEncryptionManager::default(),
         );
         let (stream_task, storage_path) = task_handler("dummy".to_owned()).await.unwrap();
         must_register_table(&router, stream_task, 1).await;
@@ -2196,12 +1838,12 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let end_ts = TimeStamp::physical_now();
-        let task_handler = router.tasks.get("dummy").unwrap().clone();
-        let mut meta = task_handler
+        let files = router.tasks.lock().await.get("dummy").unwrap().clone();
+        let mut meta = files
             .move_to_flushing_files()
             .await
             .unwrap()
-            .generate_backup_metadata(1)
+            .generate_metadata(1)
             .await
             .unwrap();
 
@@ -2221,16 +1863,16 @@ mod tests {
 
         // in some case when flush failed to write files to storage.
         // we may run `generate_metadata` again with same files.
-        let mut another_meta = task_handler
+        let mut another_meta = files
             .move_to_flushing_files()
             .await
             .unwrap()
-            .generate_backup_metadata(1)
+            .generate_metadata(1)
             .await
             .unwrap();
 
-        task_handler.flush_log(&mut meta).await.unwrap();
-        task_handler.flush_log(&mut another_meta).await.unwrap();
+        files.flush_log(&mut meta).await.unwrap();
+        files.flush_log(&mut another_meta).await.unwrap();
         // meta updated
         let files_num = meta
             .file_groups
@@ -2251,11 +1893,8 @@ mod tests {
             }
         }
 
-        task_handler
-            .flush_backup_metadata(meta, TimeStamp::new(1))
-            .await
-            .unwrap();
-        task_handler.clear_flushing_files().await;
+        files.flush_meta(meta).await.unwrap();
+        files.clear_flushing_files().await;
 
         drop(router);
         let cmds = collect_recv(rx);
@@ -2267,34 +1906,11 @@ mod tests {
 
         let mut meta_count = 0;
         let mut log_count = 0;
-
         for entry in walkdir::WalkDir::new(storage_path) {
             let entry = entry.unwrap();
+            let filename = entry.file_name();
+            println!("walking {}", entry.path().display());
             if entry.path().extension() == Some(OsStr::new("meta")) {
-                let filename = entry.path().file_stem().unwrap().to_os_string();
-                let parts: Vec<&str> = filename.to_str().unwrap().split('-').collect();
-
-                assert!(
-                    parts.len() >= 4,
-                    "Invalid meta file name format: expected at least 4 parts, got {}, file: {:?}",
-                    parts.len(),
-                    entry.file_name(),
-                );
-
-                for (i, label) in ["flushTs", "minDefaultTs", "minTs", "maxTs"]
-                    .iter()
-                    .enumerate()
-                {
-                    let val = u64::from_str_radix(parts[i], 16);
-                    assert!(
-                        val.is_ok(),
-                        "Failed to parse '{}' as u64 (hex) for {} in file name: {:?}",
-                        parts[i],
-                        label,
-                        entry.file_name(),
-                    );
-                }
-
                 meta_count += 1;
             } else if entry.path().extension() == Some(OsStr::new("log")) {
                 log_count += 1;
@@ -2302,7 +1918,7 @@ mod tests {
                 assert!(
                     f.len() > 10,
                     "the log file {:?} is too small (size = {}B)",
-                    entry.file_name(),
+                    filename,
                     f.len()
                 );
             }
@@ -2327,7 +1943,7 @@ mod tests {
     #[tokio::test]
     async fn test_do_flush() {
         let tmp_dir = tempfile::tempdir().unwrap();
-        let backend = external_storage::make_local_backend(tmp_dir.path());
+        let backend = external_storage_export::make_local_backend(tmp_dir.path());
         let mut task_info = StreamBackupTaskInfo::default();
         task_info.set_storage(backend);
         let stream_task = StreamTask {
@@ -2335,12 +1951,11 @@ mod tests {
             is_paused: false,
         };
         let merged_file_size_limit = 0x10000;
-        let task_handler = StreamTaskHandler::new(
+        let task_handler = StreamTaskInfo::new(
             stream_task,
             vec![(vec![], vec![])],
             merged_file_size_limit,
             make_tempfiles_cfg(tmp_dir.path()),
-            BackupEncryptionManager::default(),
         )
         .await
         .unwrap();
@@ -2358,7 +1973,6 @@ mod tests {
             store_id: 1,
             resolved_regions: &EMPTY_RESOLVE,
             resolved_ts: TimeStamp::new(1),
-            flush_ts: TimeStamp::new(1),
         };
         task_handler.do_flush(cx).await.unwrap();
         assert_eq!(task_handler.flush_failure_count(), 0);
@@ -2366,7 +1980,18 @@ mod tests {
         assert_eq!(task_handler.flushing_files.read().await.is_empty(), true);
 
         // assert backup log files
-        verify_on_disk_file(tmp_dir.path(), 2, 1);
+        let mut meta_count = 0;
+        let mut log_count = 0;
+        for entry in walkdir::WalkDir::new(tmp_dir.path()) {
+            let entry = entry.unwrap();
+            if entry.path().extension() == Some(OsStr::new("meta")) {
+                meta_count += 1;
+            } else if entry.path().extension() == Some(OsStr::new("log")) {
+                log_count += 1;
+            }
+        }
+        assert_eq!(meta_count, 1);
+        assert_eq!(log_count, 2);
     }
 
     struct ErrorStorage<Inner> {
@@ -2419,7 +2044,7 @@ mod tests {
         async fn write(
             &self,
             name: &str,
-            reader: UnpinReader<'_>,
+            reader: UnpinReader,
             content_length: u64,
         ) -> io::Result<()> {
             (self.error_on_write)()?;
@@ -2432,17 +2057,6 @@ mod tests {
 
         fn read_part(&self, name: &str, off: u64, len: u64) -> ExternalData<'_> {
             self.inner.read_part(name, off, len)
-        }
-
-        fn iter_prefix(
-            &self,
-            _prefix: &str,
-        ) -> LocalBoxStream<'_, std::result::Result<BlobObject, io::Error>> {
-            unreachable!()
-        }
-
-        fn delete(&self, _name: &str) -> LocalBoxFuture<'_, io::Result<()>> {
-            unreachable!()
         }
     }
 
@@ -2471,24 +2085,24 @@ mod tests {
                 temp_file_memory_quota: 2,
                 max_flush_interval: Duration::from_secs(300),
             },
-            BackupEncryptionManager::default(),
         ));
         let cx = FlushContext {
             task_name: "error_prone",
             store_id: 42,
             resolved_regions: &EMPTY_RESOLVE,
             resolved_ts: TimeStamp::max(),
-            flush_ts: TimeStamp::max(),
         };
         let (task, _path) = task_handler("error_prone".to_owned()).await?;
         must_register_table(router.as_ref(), task, 1).await;
-        router.must_mut_task_info("error_prone", |i| {
-            i.storage = Arc::new(ErrorStorage::with_first_time_error(i.storage.clone()))
-        });
+        router
+            .must_mut_task_info("error_prone", |i| {
+                i.storage = Arc::new(ErrorStorage::with_first_time_error(i.storage.clone()))
+            })
+            .await;
         check_on_events_result(&router.on_events(build_kv_event(0, 10)).await);
         assert!(router.do_flush(cx).await.is_none());
         check_on_events_result(&router.on_events(build_kv_event(10, 10)).await);
-        let t = router.get_task_handler("error_prone").unwrap();
+        let t = router.get_task_info("error_prone").await.unwrap();
         let _ = router.do_flush(cx).await;
         assert_eq!(t.total_size() > 0, true);
 
@@ -2510,7 +2124,6 @@ mod tests {
                 temp_file_memory_quota: 32 * 2,
                 max_flush_interval: Duration::from_secs(300),
             },
-            BackupEncryptionManager::default(),
         );
         let mut stream_task = StreamBackupTaskInfo::default();
         stream_task.set_name("nothing".to_string());
@@ -2527,7 +2140,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let task = router.get_task_handler("nothing").unwrap();
+        let task = router.get_task_info("nothing").await.unwrap();
         task.set_flushing_status_cas(false, true).unwrap();
         let ts = TimeStamp::compose(TimeStamp::physical_now(), 42);
         let cx = FlushContext {
@@ -2535,7 +2148,6 @@ mod tests {
             store_id: 1,
             resolved_regions: &EMPTY_RESOLVE,
             resolved_ts: ts,
-            flush_ts: ts,
         };
         let rts = router.do_flush(cx).await.unwrap();
         assert_eq!(ts.into_inner(), rts);
@@ -2553,18 +2165,19 @@ mod tests {
                 temp_file_memory_quota: 2,
                 max_flush_interval: Duration::from_secs(300),
             },
-            BackupEncryptionManager::default(),
         ));
         let (task, _path) = task_handler("cleanup_test".to_owned()).await?;
         must_register_table(&router, task, 1).await;
         write_simple_data(&router).await;
         let tempfiles = router
-            .get_task_handler("cleanup_test")
+            .get_task_info("cleanup_test")
+            .await
             .unwrap()
             .temp_file_pool
             .clone();
         router
-            .get_task_handler("cleanup_test")?
+            .get_task_info("cleanup_test")
+            .await?
             .move_to_flushing_files()
             .await?;
         write_simple_data(&router).await;
@@ -2608,19 +2221,19 @@ mod tests {
                 temp_file_memory_quota: 2,
                 max_flush_interval: Duration::from_secs(300),
             },
-            BackupEncryptionManager::default(),
         ));
         let (task, _path) = task_handler("flush_failure".to_owned()).await?;
         must_register_table(router.as_ref(), task, 1).await;
-        router.must_mut_task_info("flush_failure", |i| {
-            i.storage = Arc::new(ErrorStorage::with_always_error(i.storage.clone()))
-        });
+        router
+            .must_mut_task_info("flush_failure", |i| {
+                i.storage = Arc::new(ErrorStorage::with_always_error(i.storage.clone()))
+            })
+            .await;
         let cx = FlushContext {
             task_name: "flush_failure",
             store_id: 42,
             resolved_regions: &EMPTY_RESOLVE,
             resolved_ts: TimeStamp::zero(),
-            flush_ts: TimeStamp::new(1),
         };
         for i in 0..=FLUSH_FAILURE_BECOME_FATAL_THRESHOLD {
             check_on_events_result(&router.on_events(build_kv_event((i * 10) as _, 10)).await);
@@ -2729,8 +2342,8 @@ mod tests {
     async fn test_update_global_checkpoint() -> Result<()> {
         // create local storage
         let tmp_dir = tempfile::tempdir().unwrap();
-        let backend = external_storage::make_local_backend(tmp_dir.path());
-        let backup_encryption_manager = BackupEncryptionManager::default();
+        let backend = external_storage_export::make_local_backend(tmp_dir.path());
+
         // build a StreamTaskInfo
         let mut task_info = StreamBackupTaskInfo::default();
         task_info.set_storage(backend);
@@ -2738,39 +2351,33 @@ mod tests {
             info: task_info,
             is_paused: false,
         };
-        let task_handler = StreamTaskHandler::new(
+        let task = StreamTaskInfo::new(
             stream_task,
             vec![(vec![], vec![])],
             0x100000,
             make_tempfiles_cfg(tmp_dir.path()),
-            backup_encryption_manager,
         )
         .await
         .unwrap();
-        task_handler
-            .global_checkpoint_ts
-            .store(10001, Ordering::SeqCst);
+        task.global_checkpoint_ts.store(10001, Ordering::SeqCst);
 
         // test no need to update global checkpoint
         let store_id = 3;
         let mut global_checkpoint = 10000;
-        let is_updated = task_handler
+        let is_updated = task
             .update_global_checkpoint(global_checkpoint, store_id)
             .await?;
         assert_eq!(is_updated, false);
-        assert_eq!(
-            task_handler.global_checkpoint_ts.load(Ordering::SeqCst),
-            10001
-        );
+        assert_eq!(task.global_checkpoint_ts.load(Ordering::SeqCst), 10001);
 
         // test update global checkpoint
         global_checkpoint = 10002;
-        let is_updated = task_handler
+        let is_updated = task
             .update_global_checkpoint(global_checkpoint, store_id)
             .await?;
         assert_eq!(is_updated, true);
         assert_eq!(
-            task_handler.global_checkpoint_ts.load(Ordering::SeqCst),
+            task.global_checkpoint_ts.load(Ordering::SeqCst),
             global_checkpoint
         );
 
@@ -2789,7 +2396,7 @@ mod tests {
     }
 
     struct MockCheckContentStorage {
-        s: Box<dyn ExternalStorage>,
+        s: NoopStorage,
     }
 
     #[async_trait::async_trait]
@@ -2805,7 +2412,7 @@ mod tests {
         async fn write(
             &self,
             _name: &str,
-            mut reader: UnpinReader<'_>,
+            mut reader: UnpinReader,
             content_length: u64,
         ) -> io::Result<()> {
             let mut data = Vec::new();
@@ -2822,45 +2429,29 @@ mod tests {
             }
         }
 
-        fn read(&self, name: &str) -> ExternalData<'_> {
+        fn read(&self, name: &str) -> external_storage::ExternalData<'_> {
             self.s.read(name)
         }
 
-        fn read_part(&self, name: &str, off: u64, len: u64) -> ExternalData<'_> {
+        fn read_part(&self, name: &str, off: u64, len: u64) -> external_storage::ExternalData<'_> {
             self.s.read_part(name, off, len)
-        }
-
-        /// Walk the prefix of the blob storage.
-        /// It returns the stream of items.
-        fn iter_prefix(
-            &self,
-            _prefix: &str,
-        ) -> LocalBoxStream<'_, std::result::Result<BlobObject, io::Error>> {
-            unreachable!()
-        }
-
-        fn delete(&self, _name: &str) -> LocalBoxFuture<'_, io::Result<()>> {
-            unreachable!()
         }
     }
 
     #[tokio::test]
     async fn test_est_len_in_flush() -> Result<()> {
         let noop_s = NoopStorage::default();
-        let mock_external_storage = Arc::new(MockCheckContentStorage {
-            s: Box::new(noop_s),
-        });
+        let ms = MockCheckContentStorage { s: noop_s };
 
         let file_name = format!("{}", uuid::Uuid::new_v4());
         let file_path = Path::new(&file_name);
-        let tempfile = TempDir::new().unwrap();
+        let tempfile = TempDir::new("test_est_len_in_flush").unwrap();
         let cfg = make_tempfiles_cfg(tempfile.path());
-        let backup_encryption_manager = BackupEncryptionManager::default();
-        let pool = Arc::new(TempFilePool::new(cfg, backup_encryption_manager.clone()).unwrap());
+        let pool = Arc::new(TempFilePool::new(cfg).unwrap());
         let mut f = pool.open_for_write(file_path).unwrap();
         f.write_all(b"test-data").await?;
         f.done().await?;
-        let mut data_file = DataFile::new(file_path, &pool).unwrap();
+        let mut data_file = DataFile::new(&file_path, &pool).await.unwrap();
         let info = DataFileInfo::new();
 
         let mut meta = MetadataInfo::with_capacity(1);
@@ -2868,24 +2459,14 @@ mod tests {
         let tmp_key = TempFileKey::of(&kv_event.events[0], 1);
         data_file.inner.done().await?;
         let mut files = vec![(tmp_key, data_file, info)];
-
-        let stream_task = StreamTask {
-            info: StreamBackupTaskInfo::default(),
-            is_paused: false,
-        };
-        let stream_task_handler = StreamTaskHandler::new_test_only(
-            stream_task,
-            vec![(vec![], vec![])],
-            0x100000,
-            mock_external_storage,
+        let result = StreamTaskInfo::merge_and_flush_log_files_to(
+            Arc::new(ms),
+            &mut files[0..],
+            &mut meta,
+            false,
             pool.clone(),
-            backup_encryption_manager,
         )
-        .unwrap();
-
-        let result = stream_task_handler
-            .merge_and_flush_log_files_to(&mut files[0..], &mut meta, false)
-            .await;
+        .await;
         result.unwrap();
         Ok(())
     }
@@ -2902,7 +2483,6 @@ mod tests {
                 temp_file_memory_quota: 2,
                 max_flush_interval: cfg.max_flush_interval.0,
             },
-            BackupEncryptionManager::default(),
         ));
 
         let mut cfg_manager = BackupStreamConfigManager::new(sched, cfg.clone());
@@ -2920,7 +2500,7 @@ mod tests {
         match &cmds[0] {
             Task::ChangeConfig(cfg) => {
                 assert!(matches!(cfg, _new_cfg));
-                router.update_config(cfg);
+                router.udpate_config(cfg);
                 assert_eq!(
                     router.max_flush_interval.rl().to_owned(),
                     _new_cfg.max_flush_interval.0
@@ -2931,7 +2511,7 @@ mod tests {
     }
 
     #[test]
-    fn test_update_invalid_config() {
+    fn test_udpate_invalid_config() {
         let cfg = BackupStreamConfig::default();
         let (sched, _) = dummy_scheduler();
         let mut cfg_manager = BackupStreamConfigManager::new(sched, cfg.clone());
@@ -2959,14 +2539,15 @@ mod tests {
                 temp_file_memory_quota: 2,
                 max_flush_interval: Duration::from_secs(300),
             },
-            BackupEncryptionManager::default(),
         ));
 
         let (task, _path) = task_handler("race".to_owned()).await?;
         must_register_table(router.as_ref(), task, 1).await;
-        router.must_mut_task_info("race", |i| {
-            i.storage = Arc::new(NoopStorage::default());
-        });
+        router
+            .must_mut_task_info("race", |i| {
+                i.storage = Arc::new(NoopStorage::default());
+            })
+            .await;
         let mut b = KvEventsBuilder::new(42, 0);
         b.put_table(CF_DEFAULT, 1, b"k1", b"v1");
         let events_before_flush = b.finish();
@@ -2983,7 +2564,7 @@ mod tests {
         let (fp_tx, fp_rx) = std::sync::mpsc::sync_channel(0);
         let fp_rx = std::sync::Mutex::new(fp_rx);
 
-        let t = router.get_task_handler("race").unwrap();
+        let t = router.get_task_info("race").await.unwrap();
         let _ = router.on_events(events_before_flush).await;
 
         // make generate temp files ***happen after*** moving files to flushing_files
@@ -3013,7 +2594,6 @@ mod tests {
             store_id: 42,
             resolved_regions: &EMPTY_RESOLVE,
             resolved_ts: TimeStamp::max(),
-            flush_ts: TimeStamp::new(1),
         };
         // set flush status to true, because we disabled the auto flush.
         t.set_flushing_status(true);
@@ -3037,294 +2617,5 @@ mod tests {
         assert!(res.is_some());
         assert_eq!(t.files.read().await.len(), 0,);
         Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_encryption_not_set() -> Result<()> {
-        test_encryption(BackupEncryptionManager::default()).await
-    }
-
-    #[tokio::test]
-    async fn test_encryption_plaintext_data_key() -> Result<()> {
-        // set up plaintext data key
-        //
-        let data_key: [u8; 32] = rand::thread_rng().gen();
-        let mut cipher = CipherInfo::new();
-        cipher.set_cipher_key(data_key.to_vec());
-        cipher.set_cipher_type(EncryptionMethod::Aes256Ctr);
-
-        let multi_master_key_backends = MultiMasterKeyBackend::new();
-        let backup_encryption_manager = BackupEncryptionManager::new(
-            Some(cipher),
-            EncryptionMethod::Aes256Ctr,
-            multi_master_key_backends,
-            None,
-        );
-
-        test_encryption(backup_encryption_manager).await
-    }
-    #[tokio::test]
-    async fn test_encryption_master_key_based() -> Result<()> {
-        // set up file backed master key
-        //
-        let hex_bytes = encryption::test_utils::generate_random_master_key();
-        let (path, _dir) = encryption::test_utils::create_master_key_file_test_only(&hex_bytes);
-        let master_key_config = MasterKeyConfig::File {
-            config: FileConfig {
-                path: path.to_string_lossy().into_owned(),
-            },
-        };
-        let multi_master_key_backends = MultiMasterKeyBackend::new();
-        multi_master_key_backends
-            .update_from_config_if_needed(vec![master_key_config], create_async_backend)
-            .await?;
-
-        let backup_encryption_manager = BackupEncryptionManager::new(
-            None,
-            EncryptionMethod::Aes256Ctr,
-            multi_master_key_backends,
-            None,
-        );
-
-        test_encryption(backup_encryption_manager).await
-    }
-
-    async fn test_encryption(backup_encryption_manager: BackupEncryptionManager) -> Result<()> {
-        // set up local file backend for external storage
-        //
-        let local_backend_file_path = tempfile::tempdir().unwrap();
-        let backend = external_storage::make_local_backend(local_backend_file_path.path());
-        let mut task_info = StreamBackupTaskInfo::default();
-        task_info.set_storage(backend);
-        let stream_task = StreamTask {
-            info: task_info,
-            is_paused: false,
-        };
-        let merged_file_size_limit = 0x10000000;
-
-        // configure task handler with optional encryption
-        //
-        let task_handler = StreamTaskHandler::new(
-            stream_task,
-            vec![(vec![], vec![])],
-            merged_file_size_limit,
-            make_tempfiles_cfg(tempfile::tempdir().unwrap().path()),
-            backup_encryption_manager.clone(),
-        )
-        .await
-        .unwrap();
-
-        // write some kv into the handler and flush it
-        //
-        let kv_events = build_kv_event(0, 1000000);
-        task_handler.on_events(kv_events.clone()).await?;
-        task_handler.set_flushing_status(true);
-        let start = Instant::now();
-        let cx = FlushContext {
-            task_name: &task_handler.task.info.name,
-            store_id: 1,
-            resolved_regions: &EMPTY_RESOLVE,
-            resolved_ts: TimeStamp::new(1),
-            flush_ts: TimeStamp::new(1),
-        };
-        task_handler.do_flush(cx).await?;
-        let duration = start.saturating_elapsed();
-        println!("Time taken for do_flush: {:?}", duration);
-
-        // verify_on_disk_file(local_backend_file_path.path(), 1, 1);
-
-        // read meta file first to figure out the data file offset
-        //
-        let meta_file_paths = meta_file_names(local_backend_file_path.path());
-        assert_eq!(meta_file_paths.len(), 1);
-
-        let meta_vec = read_and_parse_meta_files(meta_file_paths);
-        assert_eq!(meta_vec.len(), 1);
-
-        let meta = meta_vec.first().unwrap();
-        let file_group = meta.file_groups.first().unwrap();
-
-        // read log file and parse to kv pairs
-        //
-        let log_file_paths = log_file_names(local_backend_file_path.path());
-        assert_eq!(log_file_paths.len(), 1);
-
-        let mut read_out_kv_pairs = read_and_parse_log_file(
-            log_file_paths.first().unwrap(),
-            file_group,
-            backup_encryption_manager,
-        )
-        .await;
-
-        // check whether kv pair matches
-        //
-        let mut expected_kv_pairs = events_to_kv_pair(&kv_events);
-        read_out_kv_pairs.sort();
-        expected_kv_pairs.sort();
-        assert_eq!(read_out_kv_pairs, expected_kv_pairs);
-        Ok(())
-    }
-
-    fn verify_on_disk_file(path: &Path, num_log: i32, num_backup_meta: i32) {
-        let mut meta_count = 0;
-        let mut log_count = 0;
-        for entry in walkdir::WalkDir::new(path) {
-            let entry = entry.unwrap();
-
-            if entry.path().extension() == Some(OsStr::new("meta")) {
-                meta_count += 1;
-            } else if entry.path().extension() == Some(OsStr::new("log")) {
-                log_count += 1;
-            }
-        }
-        assert_eq!(meta_count, num_backup_meta);
-        assert_eq!(log_count, num_log);
-    }
-
-    fn log_file_names(path: &Path) -> Vec<PathBuf> {
-        let mut log_files = Vec::new();
-        for entry in walkdir::WalkDir::new(path) {
-            let entry = entry.unwrap();
-            if entry.path().extension() == Some(OsStr::new("log")) {
-                log_files.push(entry.path().to_path_buf());
-            }
-        }
-        log_files
-    }
-
-    fn meta_file_names(path: &Path) -> Vec<PathBuf> {
-        let mut meta_files = Vec::new();
-        for entry in walkdir::WalkDir::new(path) {
-            let entry = entry.unwrap();
-            if entry.path().extension() == Some(OsStr::new("meta")) {
-                if let Some(filename) = entry.path().file_stem().and_then(OsStr::to_str) {
-                    // v1/backupmeta/{a}-{b}-{c}-{d}.meta
-                    let parts: Vec<&str> = filename.split('-').collect();
-                    if parts.len() == 4 {
-                        for p in parts {
-                            assert!(
-                                u64::from_str_radix(p, 16).is_ok(),
-                                "Part '{}' is not a valid hex u64",
-                                p
-                            );
-                        }
-                        meta_files.push(entry.path().to_path_buf());
-                    } else {
-                        panic!("backup meta file format changed")
-                    }
-                }
-            }
-        }
-        meta_files
-    }
-
-    fn read_and_parse_meta_files(paths: Vec<PathBuf>) -> Vec<Metadata> {
-        let mut meta_vec = Vec::new();
-        for path in paths {
-            let content = std::fs::read(path).unwrap();
-            let metadata = protobuf::parse_from_bytes::<Metadata>(&content).unwrap();
-            meta_vec.push(metadata);
-        }
-        meta_vec
-    }
-
-    async fn read_and_parse_log_file(
-        path: &Path,
-        file_group_meta: &DataFileGroup,
-        backup_encryption_manager: BackupEncryptionManager,
-    ) -> Vec<(Vec<u8>, Vec<u8>)> {
-        use tokio::io::AsyncReadExt;
-
-        let mut log_file_bytes = Vec::new();
-
-        // read out the entire disk
-        //
-        let mut bytes_buf = Vec::new();
-        BufReader::new(File::open(path).await.unwrap())
-            .read_to_end(&mut bytes_buf)
-            .await
-            .unwrap();
-        // find each file length and read it and append to the result
-        //
-        assert!(!file_group_meta.get_data_files_info().is_empty());
-        for file_info in file_group_meta.get_data_files_info() {
-            let slice = &bytes_buf[file_info.range_offset as usize
-                ..(file_info.range_offset + file_info.range_length) as usize];
-            let mut file_buf = Vec::new();
-            if let Some(cipher_info) = backup_encryption_manager.plaintext_data_key.as_ref() {
-                let iv = Iv::from_slice(&file_info.file_encryption_info.as_ref().unwrap().file_iv)
-                    .unwrap();
-                let mut decrypter = DecrypterReader::new(
-                    BufReader::new(Cursor::new(slice)).compat(),
-                    file_info
-                        .file_encryption_info
-                        .as_ref()
-                        .unwrap()
-                        .encryption_method,
-                    &cipher_info.cipher_key,
-                    iv,
-                )
-                .unwrap();
-                let mut decrypted_buf = Vec::new();
-                decrypter.read_to_end(&mut decrypted_buf).await.unwrap();
-                let mut decoder = ZstdDecoder::new(BufReader::new(Cursor::new(decrypted_buf)));
-                decoder.read_to_end(&mut file_buf).await.unwrap();
-            } else if backup_encryption_manager
-                .is_master_key_backend_initialized()
-                .await
-            {
-                let iv = Iv::from_slice(&file_info.file_encryption_info.as_ref().unwrap().file_iv)
-                    .unwrap();
-                let cipher_data_key = file_info
-                    .file_encryption_info
-                    .as_ref()
-                    .unwrap()
-                    .get_master_key_based()
-                    .data_key_encrypted_content
-                    .first()
-                    .unwrap();
-                let plaintext_data_key = backup_encryption_manager
-                    .decrypt_data_key(cipher_data_key)
-                    .await
-                    .unwrap();
-                let mut decrypter = DecrypterReader::new(
-                    BufReader::new(Cursor::new(slice)).compat(),
-                    file_info
-                        .file_encryption_info
-                        .as_ref()
-                        .unwrap()
-                        .encryption_method,
-                    &plaintext_data_key,
-                    iv,
-                )
-                .unwrap();
-                let mut decrypted_buf = Vec::new();
-                decrypter.read_to_end(&mut decrypted_buf).await.unwrap();
-                let mut decoder = ZstdDecoder::new(BufReader::new(Cursor::new(decrypted_buf)));
-                decoder.read_to_end(&mut file_buf).await.unwrap();
-            } else {
-                let mut decode_reader = ZstdDecoder::new(BufReader::new(Cursor::new(slice)));
-                decode_reader.read_to_end(&mut file_buf).await.unwrap();
-            }
-
-            // parse to kv pair
-            //
-            let mut event_iter = EventIterator::new(&file_buf);
-            while event_iter.valid() {
-                event_iter.next().unwrap();
-                let key = event_iter.key();
-                let val = event_iter.value();
-                log_file_bytes.push((key.to_vec(), val.to_vec()))
-            }
-        }
-        log_file_bytes
-    }
-
-    fn events_to_kv_pair(apply_events: &ApplyEvents) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let mut kv_pairs = Vec::new();
-        for apply_event in &apply_events.events {
-            kv_pairs.push((apply_event.key.clone(), apply_event.value.clone()));
-        }
-        kv_pairs
     }
 }

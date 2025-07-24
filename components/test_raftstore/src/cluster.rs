@@ -4,7 +4,10 @@ use std::{
     collections::hash_map::Entry as MapEntry,
     error::Error as StdError,
     result,
-    sync::{mpsc, Arc, Mutex, RwLock},
+    sync::{
+        mpsc::{self},
+        Arc, Mutex, RwLock,
+    },
     thread,
     time::Duration,
 };
@@ -15,8 +18,8 @@ use encryption_export::DataKeyManager;
 use engine_rocks::{RocksEngine, RocksSnapshot, RocksStatistics};
 use engine_test::raft::RaftTestEngine;
 use engine_traits::{
-    CompactExt, Engines, Iterable, ManualCompactionOptions, MiscExt, Mutable, Peekable,
-    RaftEngineReadOnly, SyncMutable, WriteBatch, WriteBatchExt, CF_DEFAULT, CF_RAFT,
+    CompactExt, Engines, Iterable, MiscExt, Mutable, Peekable, RaftEngineReadOnly, SyncMutable,
+    WriteBatch, WriteBatchExt, CF_DEFAULT, CF_RAFT,
 };
 use file_system::IoRateLimiter;
 use futures::{self, channel::oneshot, executor::block_on, future::BoxFuture, StreamExt};
@@ -39,7 +42,7 @@ use raftstore::{
         fsm::{
             create_raft_batch_system,
             store::{StoreMeta, PENDING_MSG_CAP},
-            ApplyRouter, RaftBatchSystem, RaftRouter,
+            RaftBatchSystem, RaftRouter,
         },
         transport::CasualRouter,
         *,
@@ -60,6 +63,7 @@ use txn_types::WriteBatchFlags;
 
 use super::*;
 use crate::Config;
+
 // We simulate 3 or 5 nodes, each has a store.
 // Sometimes, we use fixed id to test, which means the id
 // isn't allocated by pd, and node id, store id are same.
@@ -103,7 +107,6 @@ pub trait Simulator {
     fn get_snap_dir(&self, node_id: u64) -> String;
     fn get_snap_mgr(&self, node_id: u64) -> &SnapManager;
     fn get_router(&self, node_id: u64) -> Option<RaftRouter<RocksEngine, RaftTestEngine>>;
-    fn get_apply_router(&self, node_id: u64) -> Option<ApplyRouter<RocksEngine>>;
     fn add_send_filter(&mut self, node_id: u64, filter: Box<dyn Filter>);
     fn clear_send_filters(&mut self, node_id: u64);
     fn add_recv_filter(&mut self, node_id: u64, filter: Box<dyn Filter>);
@@ -260,29 +263,6 @@ impl<T: Simulator> Cluster<T> {
         self.raft_statistics.push(raft_statistics);
     }
 
-    pub fn restart_engine(&mut self, node_id: u64) {
-        let idx = node_id as usize - 1;
-        let path = self.paths.remove(idx);
-        {
-            self.dbs.remove(idx);
-            self.key_managers.remove(idx);
-            self.sst_workers.remove(idx);
-            self.kv_statistics.remove(idx);
-            self.raft_statistics.remove(idx);
-            self.engines.remove(&node_id);
-        }
-        let (engines, key_manager, dir, sst_worker, kv_statistics, raft_statistics) =
-            start_test_engine(None, self.io_rate_limiter.clone(), &self.cfg, path);
-        self.dbs.insert(idx, engines);
-        self.key_managers.insert(idx, key_manager);
-        self.paths.insert(idx, dir);
-        self.sst_workers.insert(idx, sst_worker);
-        self.kv_statistics.insert(idx, kv_statistics);
-        self.raft_statistics.insert(idx, raft_statistics);
-        self.engines
-            .insert(node_id, self.dbs.last().unwrap().clone());
-    }
-
     pub fn create_engines(&mut self) {
         self.io_rate_limiter = Some(Arc::new(
             self.cfg
@@ -339,13 +319,8 @@ impl<T: Simulator> Cluster<T> {
     pub fn compact_data(&self) {
         for engine in self.engines.values() {
             let db = &engine.kv;
-            db.compact_range_cf(
-                CF_DEFAULT,
-                None,
-                None,
-                ManualCompactionOptions::new(false, 1, false),
-            )
-            .unwrap();
+            db.compact_range_cf(CF_DEFAULT, None, None, false, 1)
+                .unwrap();
         }
     }
 
@@ -1317,9 +1292,7 @@ impl<T: Simulator> Cluster<T> {
                     engine_traits::CF_RAFT,
                     &keys::region_state_key(region_id),
                 )
-                .unwrap()
-                && state.get_state() == peer_state
-            {
+                .unwrap() && state.get_state() == peer_state {
                 return;
             }
             sleep_ms(10);
@@ -1486,17 +1459,6 @@ impl<T: Simulator> Cluster<T> {
         let transfer_leader = new_admin_request(region_id, &epoch, new_transfer_leader_cmd(leader));
         self.call_command_on_leader(transfer_leader, Duration::from_secs(5))
             .unwrap()
-    }
-
-    pub fn try_transfer_leader_with_timeout(
-        &mut self,
-        region_id: u64,
-        leader: metapb::Peer,
-        timeout: Duration,
-    ) -> Result<RaftCmdResponse> {
-        let epoch = self.get_region_epoch(region_id);
-        let transfer_leader = new_admin_request(region_id, &epoch, new_transfer_leader_cmd(leader));
-        self.call_command_on_leader(transfer_leader, timeout)
     }
 
     pub fn get_snap_dir(&self, node_id: u64) -> String {
@@ -1936,10 +1898,6 @@ impl<T: Simulator> Cluster<T> {
         self.sim.rl().get_router(node_id)
     }
 
-    pub fn get_apply_router(&self, node_id: u64) -> Option<ApplyRouter<RocksEngine>> {
-        self.sim.rl().get_apply_router(node_id)
-    }
-
     pub fn refresh_region_bucket_keys(
         &mut self,
         region: &metapb::Region,
@@ -2048,10 +2006,6 @@ impl<T: Simulator> Drop for Cluster<T> {
 pub trait RawEngine<EK: engine_traits::KvEngine>:
     Peekable<DbVector = EK::DbVector> + SyncMutable
 {
-    fn region_cache_engine(&self) -> bool {
-        false
-    }
-
     fn region_local_state(&self, region_id: u64)
     -> engine_traits::Result<Option<RegionLocalState>>;
 

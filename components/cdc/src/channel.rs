@@ -214,12 +214,8 @@ pub fn channel(conn_id: ConnId, buffer: usize, memory_quota: Arc<MemoryQuota>) -
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SendError {
-    // Full is returned by the sender if the channel is full, this should only happen to the
-    // bounded sender.
     Full,
-    // Disconnected is returned by the sender if the channel is disconnected.
     Disconnected,
-    // Congested is returned if memory quota exceeded.
     Congested,
 }
 
@@ -577,10 +573,10 @@ mod tests {
 
     #[test]
     fn test_congest() {
-        let mut e = Event::default();
+        let mut e = kvproto::cdcpb::Event::default();
         e.region_id = 1;
         let event = CdcEvent::Event(e.clone());
-        assert_ne!(event.size(), 0);
+        assert!(event.size() != 0);
         // 1KB
         let max_pending_bytes = 1024;
         let buffer = max_pending_bytes / event.size();
@@ -594,10 +590,10 @@ mod tests {
 
     #[test]
     fn test_set_capacity() {
-        let mut e = Event::default();
+        let mut e = kvproto::cdcpb::Event::default();
         e.region_id = 1;
         let event = CdcEvent::Event(e.clone());
-        assert_ne!(event.size(), 0);
+        assert!(event.size() != 0);
         // 1KB
         let max_pending_bytes = 1024;
         let buffer = max_pending_bytes / event.size();
@@ -645,10 +641,10 @@ mod tests {
 
     #[test]
     fn test_force_send() {
-        let mut e = Event::default();
+        let mut e = kvproto::cdcpb::Event::default();
         e.region_id = 1;
         let event = CdcEvent::Event(e.clone());
-        assert_ne!(event.size(), 0);
+        assert!(event.size() != 0);
         // 1KB
         let max_pending_bytes = 1024;
         let buffer = max_pending_bytes / event.size();
@@ -668,10 +664,10 @@ mod tests {
 
     #[test]
     fn test_channel_memory_leak() {
-        let mut e = Event::default();
+        let mut e = kvproto::cdcpb::Event::default();
         e.region_id = 1;
         let event = CdcEvent::Event(e.clone());
-        assert_ne!(event.size(), 0);
+        assert!(event.size() != 0);
         // 1KB
         let max_pending_bytes = 1024;
         let buffer = max_pending_bytes / event.size() + 1;

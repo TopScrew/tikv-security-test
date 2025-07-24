@@ -146,8 +146,7 @@ fn test_txn_gc_keys_handled() {
         feature_gate,
         Arc::new(MockRegionInfoProvider::new(vec![])),
     );
-    let coprocessor_host = CoprocessorHost::default();
-    gc_worker.start(store_id, coprocessor_host).unwrap();
+    gc_worker.start(store_id).unwrap();
 
     let mut r1 = Region::default();
     r1.set_id(1);
@@ -159,7 +158,7 @@ fn test_txn_gc_keys_handled() {
 
     let sp_provider = MockSafePointProvider(200);
     let mut host = CoprocessorHost::<RocksEngine>::default();
-    let ri_provider = RegionInfoAccessor::new(&mut host, Arc::new(|| false), Box::new(|| 0));
+    let ri_provider = RegionInfoAccessor::new(&mut host);
     let auto_gc_cfg = AutoGcConfig::new(sp_provider, ri_provider, 1);
     let safe_point = Arc::new(AtomicU64::new(500));
 
@@ -292,8 +291,7 @@ fn test_raw_gc_keys_handled() {
         feature_gate,
         Arc::new(MockRegionInfoProvider::new(vec![])),
     );
-    let coprocessor_host = CoprocessorHost::default();
-    gc_worker.start(store_id, coprocessor_host).unwrap();
+    gc_worker.start(store_id).unwrap();
 
     let mut r1 = Region::default();
     r1.set_id(1);
@@ -305,7 +303,7 @@ fn test_raw_gc_keys_handled() {
 
     let sp_provider = MockSafePointProvider(200);
     let mut host = CoprocessorHost::<RocksEngine>::default();
-    let ri_provider = RegionInfoAccessor::new(&mut host, Arc::new(|| false), Box::new(|| 0));
+    let ri_provider = RegionInfoAccessor::new(&mut host);
     let auto_gc_cfg = AutoGcConfig::new(sp_provider, ri_provider, store_id);
     let safe_point = Arc::new(AtomicU64::new(500));
 

@@ -12,7 +12,8 @@ use async_channel::SendError;
 use causal_ts::{CausalTsProvider, CausalTsProviderImpl};
 use concurrency_manager::ConcurrencyManager;
 use engine_traits::{name_to_cf, raw_ttl::ttl_current_ts, CfName, KvEngine, SstCompressionType};
-use external_storage::{create_storage, BackendConfig, ExternalStorage, HdfsConfig};
+use external_storage::{BackendConfig, HdfsConfig};
+use external_storage_export::{create_storage, ExternalStorage};
 use futures::{channel::mpsc::*, executor::block_on};
 use kvproto::{
     brpb::*,
@@ -38,7 +39,6 @@ use tikv_util::{
     box_err, debug, error, error_unknown,
     future::RescheduleChecker,
     impl_display_as_debug, info,
-    resizable_threadpool::ResizableRuntime,
     store::find_peer,
     time::{Instant, Limiter},
     warn,
@@ -50,7 +50,7 @@ use txn_types::{Key, Lock, TimeStamp};
 use crate::{
     metrics::*,
     softlimit::{CpuStatistics, SoftLimit, SoftLimitByCpu},
-    utils::KeyValueCodec,
+    utils::{ControlThreadPool, KeyValueCodec},
     writer::{BackupWriterBuilder, CfNameWrap},
     Error, *,
 };
@@ -416,7 +416,7 @@ impl BackupRange {
 
             let entries = batch.drain();
             if writer.need_split_keys() {
-                let this_end_key = entries.as_slice().first().map_or_else(
+                let this_end_key = entries.as_slice().get(0).map_or_else(
                     || Err(Error::Other(box_err!("get entry error: nothing in batch"))),
                     |x| {
                         x.to_key().map(|k| k.into_raw().unwrap()).map_err(|e| {
@@ -705,7 +705,7 @@ impl SoftLimitKeeper {
 /// It coordinates backup tasks and dispatches them to different workers.
 pub struct Endpoint<E: Engine, R: RegionInfoProvider + Clone + 'static> {
     store_id: u64,
-    pool: RefCell<ResizableRuntime>,
+    pool: RefCell<ControlThreadPool>,
     io_pool: Runtime,
     tablets: LocalTablets<E::Local>,
     config_manager: ConfigManager,
@@ -714,6 +714,7 @@ pub struct Endpoint<E: Engine, R: RegionInfoProvider + Clone + 'static> {
     api_version: ApiVersion,
     causal_ts_provider: Option<Arc<CausalTsProviderImpl>>, // used in rawkv apiv2 only
     resource_ctl: Option<Arc<ResourceGroupManager>>,
+
     pub(crate) engine: E,
     pub(crate) region_info: R,
 }
@@ -879,12 +880,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
         causal_ts_provider: Option<Arc<CausalTsProviderImpl>>,
         resource_ctl: Option<Arc<ResourceGroupManager>>,
     ) -> Endpoint<E, R> {
-        let pool = ResizableRuntime::new(
-            config.num_threads,
-            "bkwkr",
-            Box::new(utils::create_tokio_runtime),
-            Box::new(|new_size| BACKUP_THREAD_POOL_SIZE_GAUGE.set(new_size as i64)),
-        );
+        let pool = ControlThreadPool::new();
         let rt = utils::create_tokio_runtime(config.io_thread_size, "backup-io").unwrap();
         let config_manager = ConfigManager(Arc::new(RwLock::new(config)));
         let softlimit = SoftLimitKeeper::new(config_manager.clone());
@@ -1324,7 +1320,7 @@ pub mod tests {
     use api_version::{api_v2::RAW_KEY_PREFIX, dispatch_api_version, KvFormat, RawValue};
     use collections::HashSet;
     use engine_traits::MiscExt;
-    use external_storage::{make_local_backend, make_noop_backend};
+    use external_storage_export::{make_local_backend, make_noop_backend};
     use file_system::{IoOp, IoRateLimiter, IoType};
     use futures::{executor::block_on, stream::StreamExt};
     use kvproto::metapb;
@@ -1355,10 +1351,9 @@ pub mod tests {
     impl MockRegionInfoProvider {
         pub fn new(encode_key: bool) -> Self {
             MockRegionInfoProvider {
-                regions: Arc::new(Mutex::new(RegionCollector::new(
-                    Arc::new(RwLock::new(HashSet::default())),
-                    Box::new(|| 0),
-                ))),
+                regions: Arc::new(Mutex::new(RegionCollector::new(Arc::new(RwLock::new(
+                    HashSet::default(),
+                ))))),
                 cancel: None,
                 need_encode_key: encode_key,
             }
@@ -1507,12 +1502,8 @@ pub mod tests {
         use std::thread::sleep;
 
         let counter = Arc::new(AtomicU32::new(0));
-        let mut pool = ResizableRuntime::new(
-            3,
-            "bkwkr",
-            Box::new(utils::create_tokio_runtime),
-            Box::new(|new_size: usize| BACKUP_THREAD_POOL_SIZE_GAUGE.set(new_size as i64)),
-        );
+        let mut pool = ControlThreadPool::new();
+        pool.adjust_with(3);
 
         for i in 0..8 {
             let ctr = counter.clone();
@@ -1604,7 +1595,7 @@ pub mod tests {
             };
 
         // Test whether responses contain correct range.
-        #[allow(clippy::blocks_in_conditions)]
+        #[allow(clippy::blocks_in_if_conditions)]
         let test_handle_backup_task_range =
             |start_key: &[u8], end_key: &[u8], expect: Vec<(&[u8], &[u8])>| {
                 let tmp = TempDir::new().unwrap();
@@ -1846,7 +1837,7 @@ pub mod tests {
             };
 
         // Test whether responses contain correct range.
-        #[allow(clippy::blocks_in_conditions)]
+        #[allow(clippy::blocks_in_if_conditions)]
         let test_handle_backup_task_ranges =
             |sub_ranges: Vec<(&[u8], &[u8])>, expect: Vec<(&[u8], &[u8])>| {
                 let tmp = TempDir::new().unwrap();
@@ -2003,7 +1994,7 @@ pub mod tests {
         let mut prs = Progress::new_with_ranges(
             endpoint.store_id,
             ranges,
-            endpoint.region_info.clone(),
+            endpoint.region_info,
             KeyValueCodec::new(false, ApiVersion::V1, ApiVersion::V1),
             engine_traits::CF_DEFAULT,
         );
@@ -2549,20 +2540,20 @@ pub mod tests {
         endpoint.get_config_manager().set_num_threads(15);
         let (task, _) = Task::new(req.clone(), tx.clone()).unwrap();
         endpoint.handle_backup_task(task);
-        assert!(endpoint.pool.borrow().size() == 15);
+        assert!(endpoint.pool.borrow().size == 15);
 
         // shrink thread pool only if there are too many idle threads
         endpoint.get_config_manager().set_num_threads(10);
         req.set_start_key(vec![b'2']);
         let (task, _) = Task::new(req.clone(), tx.clone()).unwrap();
         endpoint.handle_backup_task(task);
-        assert!(endpoint.pool.borrow().size() == 10);
+        assert!(endpoint.pool.borrow().size == 15);
 
         endpoint.get_config_manager().set_num_threads(3);
         req.set_start_key(vec![b'3']);
         let (task, _) = Task::new(req, tx).unwrap();
         endpoint.handle_backup_task(task);
-        assert!(endpoint.pool.borrow().size() == 3);
+        assert!(endpoint.pool.borrow().size == 3);
 
         // make sure all tasks can finish properly.
         let responses = block_on(rx.collect::<Vec<_>>());
@@ -2571,12 +2562,8 @@ pub mod tests {
         // for testing whether dropping the pool before all tasks finished causes panic.
         // but the panic must be checked manually. (It may panic at tokio runtime
         // threads)
-        let mut pool = ResizableRuntime::new(
-            1,
-            "bkwkr",
-            Box::new(utils::create_tokio_runtime),
-            Box::new(|new_size: usize| BACKUP_THREAD_POOL_SIZE_GAUGE.set(new_size as i64)),
-        );
+        let mut pool = ControlThreadPool::new();
+        pool.adjust_with(1);
         pool.spawn(async { tokio::time::sleep(Duration::from_millis(100)).await });
         pool.adjust_with(2);
         drop(pool);
@@ -2587,8 +2574,8 @@ pub mod tests {
     fn test_backup_file_name() {
         let region = metapb::Region::default();
         let store_id = 1;
-        let test_cases = ["s3", "local", "gcs", "azure", "hdfs"];
-        let test_target = [
+        let test_cases = vec!["s3", "local", "gcs", "azure", "hdfs"];
+        let test_target = vec![
             "1/0_0_000",
             "1/0_0_000",
             "1_0_0_000",
@@ -2607,7 +2594,7 @@ pub mod tests {
             assert_eq!(target.to_string(), prefix_arr.join(delimiter));
         }
 
-        let test_target = ["1/0_0", "1/0_0", "1_0_0", "1_0_0", "1_0_0"];
+        let test_target = vec!["1/0_0", "1/0_0", "1_0_0", "1_0_0", "1_0_0"];
         for (storage_name, target) in test_cases.iter().zip(test_target.iter()) {
             let key = None;
             let filename = backup_file_name(store_id, &region, key, storage_name);
