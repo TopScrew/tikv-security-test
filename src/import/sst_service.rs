@@ -1,18 +1,13 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     convert::identity,
-    future::Future,
-    path::PathBuf,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
-use engine_traits::{CompactExt, MiscExt, CF_DEFAULT, CF_WRITE};
+use engine_traits::{CompactExt, ManualCompactionOptions, CF_DEFAULT, CF_WRITE};
 use file_system::{set_io_type, IoType};
 use futures::{sink::SinkExt, stream::TryStreamExt, FutureExt, TryFutureExt};
 use grpcio::{
@@ -21,32 +16,29 @@ use grpcio::{
 };
 use kvproto::{
     encryptionpb::EncryptionMethod,
-    errorpb,
     import_sstpb::{
-        Error as ImportPbError, ImportSst, Range, RawWriteRequest_oneof_chunk as RawChunk, SstMeta,
+        Error as ImportPbError, ImportSst, Range, RawWriteRequest_oneof_chunk as RawChunk,
         SuspendImportRpcRequest, SuspendImportRpcResponse, SwitchMode,
         WriteRequest_oneof_chunk as Chunk, *,
     },
-    kvrpcpb::Context,
     metapb::RegionEpoch,
 };
 use raftstore::{
     coprocessor::{RegionInfo, RegionInfoProvider},
-    store::util::is_epoch_stale,
+    store::{util::is_epoch_stale, ForcePartitionRangeManager},
     RegionInfoAccessor,
 };
 use raftstore_v2::StoreMeta;
 use resource_control::{with_resource_limiter, ResourceGroupManager};
 use sst_importer::{
-    error_inc, metrics::*, sst_importer::DownloadExt, sst_meta_to_path, Config, ConfigManager,
-    Error, Result, SstImporter,
+    error_inc, metrics::*, sst_importer::DownloadExt, Config, ConfigManager, Error, Result,
+    SstImporter,
 };
-use tikv_kv::{
-    Engine, LocalTablets, Modify, SnapContext, Snapshot, SnapshotExt, WriteData, WriteEvent,
-};
+use tikv_kv::{Engine, LocalTablets, Modify, WriteData};
 use tikv_util::{
     config::ReadableSize,
     future::{create_stream_with_buffer, paired_future_callback},
+    resizable_threadpool::{DeamonRuntimeHandle, ResizableRuntime},
     sys::{
         disk::{get_disk_status, DiskUsage},
         thread::ThreadBuildWrapper,
@@ -54,12 +46,12 @@ use tikv_util::{
     time::{Instant, Limiter},
     HandyRwLock,
 };
-use tokio::{runtime::Runtime, time::sleep};
-use txn_types::{Key, TimeStamp, WriteRef, WriteType};
+use tokio::time::sleep;
+use txn_types::{Key, WriteRef, WriteType};
 
 use super::{
-    make_rpc_error,
-    raft_writer::{self, wait_write},
+    ingest::{async_snapshot, ingest, IngestLatch, SuspendDeadline},
+    make_rpc_error, pb_error_inc, raft_writer,
 };
 use crate::{
     import::duplicate_detect::DuplicateDetector,
@@ -100,6 +92,11 @@ const WRITER_GC_INTERVAL: Duration = Duration::from_secs(300);
 const SUSPEND_REQUEST_MAX_SECS: u64 = // 6h
     6 * 60 * 60;
 
+// the default TTL seconds of force partition range.
+// the TTL is to ensure all force partition ranges can be
+// cleaned up eventually.
+const DEFAULT_FORCE_PARTITION_RANGE_TTL_SECONDS: u64 = 3600;
+
 fn transfer_error(err: storage::Error) -> ImportPbError {
     let mut e = ImportPbError::default();
     if let Some(region_error) = extract_region_error_from_error(&err) {
@@ -129,10 +126,13 @@ pub struct ImportSstService<E: Engine> {
     cfg: ConfigManager,
     tablets: LocalTablets<E::Local>,
     engine: E,
-    threads: Arc<Runtime>,
-    importer: Arc<SstImporter>,
+    threads: DeamonRuntimeHandle,
+    // threads_ref is for safely cleanning
+    #[allow(dead_code)]
+    threads_ref: Arc<Mutex<ResizableRuntime>>,
+    importer: Arc<SstImporter<E::Local>>,
     limiter: Limiter,
-    task_slots: Arc<Mutex<HashSet<(String /* cf_name */, PathBuf)>>>,
+    ingest_latch: Arc<IngestLatch>,
     ingest_admission_guard: Arc<Mutex<()>>,
     raft_entry_max_size: ReadableSize,
     region_info_accessor: Arc<RegionInfoAccessor>,
@@ -144,7 +144,9 @@ pub struct ImportSstService<E: Engine> {
     resource_manager: Option<Arc<ResourceGroupManager>>,
 
     // When less than now, don't accept any requests.
-    suspend_req_until: Arc<AtomicU64>,
+    suspend: Arc<SuspendDeadline>,
+
+    force_partition_range_mgr: ForcePartitionRangeManager,
 }
 
 struct RequestCollector {
@@ -189,8 +191,8 @@ impl RequestCollector {
     }
 
     fn accept_kv(&mut self, cf: &str, is_delete: bool, k: Vec<u8>, v: Vec<u8>) {
-        debug!("Accepting KV."; "cf" => %cf, 
-            "key" => %log_wrappers::Value::key(&k), 
+        debug!("Accepting KV."; "cf" => %cf,
+            "key" => %log_wrappers::Value::key(&k),
             "value" => %log_wrappers::Value::key(&v));
         // Need to skip the empty key/value that could break the transaction or cause
         // data corruption. see details at https://github.com/pingcap/tiflow/issues/5468.
@@ -327,63 +329,78 @@ impl<E: Engine> ImportSstService<E> {
         raft_entry_max_size: ReadableSize,
         engine: E,
         tablets: LocalTablets<E::Local>,
-        importer: Arc<SstImporter>,
+        importer: Arc<SstImporter<E::Local>>,
         store_meta: Option<Arc<Mutex<StoreMeta<E::Local>>>>,
         resource_manager: Option<Arc<ResourceGroupManager>>,
         region_info_accessor: Arc<RegionInfoAccessor>,
+        force_partition_range_mgr: ForcePartitionRangeManager,
     ) -> Self {
-        let props = tikv_util::thread_group::current_properties();
-        let eng = Mutex::new(engine.clone());
-        let threads = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(cfg.num_threads)
-            .enable_all()
-            .thread_name("sst-importer")
-            .with_sys_and_custom_hooks(
-                move || {
-                    tikv_util::thread_group::set_properties(props.clone());
+        let eng = Arc::new(Mutex::new(engine.clone()));
+        let create_tokio_runtime = move |thread_count: usize, thread_name: &str| {
+            let props = tikv_util::thread_group::current_properties();
+            let eng = eng.clone();
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(thread_count)
+                .enable_all()
+                .thread_name(thread_name)
+                .with_sys_and_custom_hooks(
+                    move || {
+                        tikv_util::thread_group::set_properties(props.clone());
+                        set_io_type(IoType::Import);
+                        tikv_kv::set_tls_engine(eng.lock().unwrap().clone());
+                    },
+                    move || {
+                        // SAFETY: we have set the engine at some lines above with type `E`.
+                        unsafe { tikv_kv::destroy_tls_engine::<E>() };
+                    },
+                )
+                .build()
+        };
 
-                    set_io_type(IoType::Import);
-                    tikv_kv::set_tls_engine(eng.lock().unwrap().clone());
-                },
-                move || {
-                    // SAFETY: we have set the engine at some lines above with type `E`.
-                    unsafe { tikv_kv::destroy_tls_engine::<E>() };
-                },
-            )
-            .build()
-            .unwrap();
+        let threads = ResizableRuntime::new(
+            4,
+            "impwkr",
+            Box::new(create_tokio_runtime),
+            Box::new(|_| ()),
+        );
+
+        let handle = threads.handle();
+        let threads_clone = Arc::new(Mutex::new(threads));
         if let LocalTablets::Singleton(tablet) = &tablets {
-            importer.start_switch_mode_check(threads.handle(), Some(tablet.clone()));
+            importer.start_switch_mode_check(&handle.clone(), Some(tablet.clone()));
         } else {
-            importer.start_switch_mode_check::<E::Local>(threads.handle(), None);
+            importer.start_switch_mode_check(&handle.clone(), None);
         }
-
         let writer = raft_writer::ThrottledTlsEngineWriter::default();
         let gc_handle = writer.clone();
-        threads.spawn(async move {
+        handle.spawn(async move {
             while gc_handle.try_gc() {
                 tokio::time::sleep(WRITER_GC_INTERVAL).await;
             }
         });
-
-        let cfg_mgr = ConfigManager::new(cfg);
-        threads.spawn(Self::tick(importer.clone(), cfg_mgr.clone()));
+        let num_threads = cfg.num_threads;
+        let cfg_mgr = ConfigManager::new(cfg, Arc::downgrade(&threads_clone));
+        handle.spawn(Self::tick(importer.clone(), cfg_mgr.clone()));
+        // Drop the initial pool to accept new tasks
+        threads_clone.lock().unwrap().adjust_with(num_threads);
 
         ImportSstService {
             cfg: cfg_mgr,
             tablets,
-            threads: Arc::new(threads),
+            threads: handle.clone(),
+            threads_ref: threads_clone,
             engine,
             importer,
             limiter: Limiter::new(f64::INFINITY),
-            task_slots: Arc::new(Mutex::new(HashSet::default())),
+            ingest_latch: Arc::default(),
             ingest_admission_guard: Arc::default(),
             raft_entry_max_size,
             region_info_accessor,
             writer,
             store_meta,
             resource_manager,
-            suspend_req_until: Arc::new(AtomicU64::new(0)),
+            suspend: Arc::default(),
+            force_partition_range_mgr,
         }
     }
 
@@ -391,7 +408,7 @@ impl<E: Engine> ImportSstService<E> {
         self.cfg.clone()
     }
 
-    async fn tick(importer: Arc<SstImporter>, cfg: ConfigManager) {
+    async fn tick(importer: Arc<SstImporter<E::Local>>, cfg: ConfigManager) {
         loop {
             sleep(Duration::from_secs(10)).await;
 
@@ -400,198 +417,9 @@ impl<E: Engine> ImportSstService<E> {
         }
     }
 
-    fn acquire_lock(
-        task_slots: &Arc<Mutex<HashSet<(String, PathBuf)>>>,
-        meta: &SstMeta,
-    ) -> Result<bool> {
-        let mut slots = task_slots.lock().unwrap();
-        let p = sst_meta_to_path(meta)?;
-        Ok(slots.insert((meta.get_cf_name().to_string(), p)))
-    }
-
-    fn release_lock(
-        task_slots: &Arc<Mutex<HashSet<(String, PathBuf)>>>,
-        meta: &SstMeta,
-    ) -> Result<bool> {
-        let mut slots = task_slots.lock().unwrap();
-        let p = sst_meta_to_path(meta)?;
-        Ok(slots.remove(&(meta.get_cf_name().to_string(), p)))
-    }
-
-    fn count_ssts_in_cf(
-        task_slots: &Arc<Mutex<HashSet<(String, PathBuf)>>>,
-        cf_name: &str,
-    ) -> usize {
-        let slots = task_slots.lock().unwrap();
-        let cnt = slots.iter().filter(|(cf, _)| cf == cf_name).count();
-        cnt
-    }
-
-    fn async_snapshot(
-        engine: &mut E,
-        context: &Context,
-    ) -> impl Future<Output = std::result::Result<E::Snap, errorpb::Error>> {
-        let res = engine.async_snapshot(SnapContext {
-            pb_ctx: context,
-            ..Default::default()
-        });
-        async move {
-            fail::fail_point!("failed_to_async_snapshot", |_| {
-                let mut e = errorpb::Error::default();
-                e.set_message("faild to get snapshot".to_string());
-                Err(e)
-            });
-            res.await.map_err(|e| {
-                let err: storage::Error = e.into();
-                if let Some(e) = extract_region_error_from_error(&err) {
-                    e
-                } else {
-                    let mut e = errorpb::Error::default();
-                    e.set_message(format!("{}", err));
-                    e
-                }
-            })
-        }
-    }
-
-    fn check_write_stall(
-        &self,
-        region_id: u64,
-        inflight_write_cf_sst_cnt: u64,
-    ) -> Option<errorpb::Error> {
-        let tablet = match self.tablets.get(region_id) {
-            Some(tablet) => tablet,
-            None => {
-                let mut errorpb = errorpb::Error::default();
-                errorpb.set_message(format!("region {} not found", region_id));
-                errorpb.mut_region_not_found().set_region_id(region_id);
-                return Some(errorpb);
-            }
-        };
-
-        let reject_error = |region_id: Option<u64>| -> Option<errorpb::Error> {
-            let mut errorpb = errorpb::Error::default();
-            let err = if let Some(id) = region_id {
-                format!("too many sst files are ingesting for region {}", id)
-            } else {
-                "too many sst files are ingesting".to_string()
-            };
-            let mut server_is_busy_err = errorpb::ServerIsBusy::default();
-            server_is_busy_err.set_reason(err.clone());
-            errorpb.set_message(err);
-            errorpb.set_server_is_busy(server_is_busy_err);
-            Some(errorpb)
-        };
-
-        // store_meta being Some means it is v2
-        if let Some(ref store_meta) = self.store_meta {
-            if let Some((region, _)) = store_meta.lock().unwrap().regions.get(&region_id) {
-                if !self.importer.region_in_import_mode(region)
-                    && tablet
-                        .ingest_maybe_slowdown_writes(CF_WRITE, inflight_write_cf_sst_cnt)
-                        .expect("cf")
-                {
-                    return reject_error(Some(region_id));
-                }
-            } else {
-                let mut errorpb = errorpb::Error::default();
-                errorpb.set_message(format!("region {} not found", region_id));
-                errorpb.mut_region_not_found().set_region_id(region_id);
-                return Some(errorpb);
-            }
-        } else if self.importer.get_mode() == SwitchMode::Normal
-            && tablet
-                .ingest_maybe_slowdown_writes(CF_WRITE, inflight_write_cf_sst_cnt)
-                .expect("cf")
-        {
-            // See https://github.com/tikv/tikv/issues/18549:
-            // Previously, logging SST key ranges by calling `ingest_sst_key_ranges` caused
-            // latency spikes. The logging here has been refined to avoid such
-            // performance issues.
-            warn!("SST ingest is experiencing slowdowns");
-            return reject_error(None);
-        }
-
-        None
-    }
-
-    fn ingest_files(
-        &mut self,
-        mut context: Context,
-        label: &'static str,
-        ssts: Vec<SstMeta>,
-    ) -> impl Future<Output = Result<IngestResponse>> {
-        let snapshot_res = Self::async_snapshot(&mut self.engine, &context);
-        let engine = self.engine.clone();
-        let importer = self.importer.clone();
-        async move {
-            // check api version
-            if !importer.as_ref().check_api_version(&ssts)? {
-                return Err(Error::IncompatibleApiVersion);
-            }
-
-            let mut resp = IngestResponse::default();
-            let res = match snapshot_res.await {
-                Ok(snap) => snap,
-                Err(e) => {
-                    pb_error_inc(label, &e);
-                    resp.set_error(e);
-                    return Ok(resp);
-                }
-            };
-
-            fail_point!("import::sst_service::ingest");
-            // Here we shall check whether the file has been ingested before. This operation
-            // must execute after geting a snapshot from raftstore to make sure that the
-            // current leader has applied to current term.
-            for sst in ssts.iter() {
-                if !importer.exist(sst) {
-                    warn!(
-                        "sst [{:?}] not exist. we may retry an operation that has already succeeded",
-                        sst
-                    );
-                    let mut errorpb = errorpb::Error::default();
-                    let err = "The file which would be ingested doest not exist.";
-                    let stale_err = errorpb::StaleCommand::default();
-                    errorpb.set_message(err.to_string());
-                    errorpb.set_stale_command(stale_err);
-                    resp.set_error(errorpb);
-                    return Ok(resp);
-                }
-            }
-            let modifies = ssts
-                .iter()
-                .map(|s| Modify::Ingest(Box::new(s.clone())))
-                .collect();
-            context.set_term(res.ext().get_term().unwrap().into());
-            let region_id = context.get_region_id();
-            let res = engine.async_write(
-                &context,
-                WriteData::from_modifies(modifies),
-                WriteEvent::BASIC_EVENT,
-                None,
-            );
-
-            let mut resp = IngestResponse::default();
-            if let Err(e) = wait_write(res).await {
-                if let Some(e) = extract_region_error_from_error(&e) {
-                    pb_error_inc(label, &e);
-                    resp.set_error(e);
-                } else {
-                    IMPORTER_ERROR_VEC
-                        .with_label_values(&[label, "unknown"])
-                        .inc();
-                    resp.mut_error()
-                        .set_message(format!("[region {}] ingest failed: {:?}", region_id, e));
-                }
-            }
-            Ok(resp)
-        }
-    }
-
-    async fn apply_imp(
+    async fn do_apply(
         mut req: ApplyRequest,
-        importer: Arc<SstImporter>,
+        importer: Arc<SstImporter<E::Local>>,
         writer: raft_writer::ThrottledTlsEngineWriter,
         limiter: Limiter,
         max_raft_size: usize,
@@ -607,10 +435,9 @@ impl<E: Engine> ImportSstService<E> {
             metas.push(req.take_meta());
             rules.push(req.take_rewrite_rule());
         }
-        let ext_storage = importer.wrap_kms(
+        let ext_storage = importer.auto_encrypt_local_file_if_needed(
             importer
                 .external_storage_or_cache(req.get_storage_backend(), req.get_storage_cache_id())?,
-            false,
         );
 
         let mut inflight_futures = VecDeque::new();
@@ -618,11 +445,13 @@ impl<E: Engine> ImportSstService<E> {
         let mut tasks = metas.iter().zip(rules.iter()).peekable();
         while let Some((meta, rule)) = tasks.next() {
             let buff = importer
-                .read_from_kv_file(
+                .download_kv_file(
                     meta,
                     ext_storage.clone(),
                     req.get_storage_backend(),
                     &limiter,
+                    req.cipher_info.clone().take(),
+                    req.master_keys.clone().to_vec(),
                 )
                 .await?;
             if let Some(mut r) = importer.do_apply_kv_file(
@@ -668,47 +497,6 @@ impl<E: Engine> ImportSstService<E> {
         futures::future::try_join_all(inflight_futures).await?;
 
         Ok(range)
-    }
-
-    /// Check whether we should suspend the current request.
-    fn check_suspend(&self) -> Result<()> {
-        let now = TimeStamp::physical_now();
-        let suspend_until = self.suspend_req_until.load(Ordering::SeqCst);
-        if now < suspend_until {
-            Err(Error::Suspended {
-                time_to_lease_expire: Duration::from_millis(suspend_until - now),
-            })
-        } else {
-            Ok(())
-        }
-    }
-
-    /// suspend requests for a period.
-    ///
-    /// # returns
-    ///
-    /// whether for now, the requests has already been suspended.
-    pub fn suspend_requests(&self, for_time: Duration) -> bool {
-        let now = TimeStamp::physical_now();
-        let last_suspend_until = self.suspend_req_until.load(Ordering::SeqCst);
-        let suspended = now < last_suspend_until;
-        let suspend_until = TimeStamp::physical_now() + for_time.as_millis() as u64;
-        self.suspend_req_until
-            .store(suspend_until, Ordering::SeqCst);
-        suspended
-    }
-
-    /// allow all requests to enter.
-    ///
-    /// # returns
-    ///
-    /// whether requests has already been previously suspended.
-    pub fn allow_requests(&self) -> bool {
-        let now = TimeStamp::physical_now();
-        let last_suspend_until = self.suspend_req_until.load(Ordering::SeqCst);
-        let suspended = now < last_suspend_until;
-        self.suspend_req_until.store(0, Ordering::SeqCst);
-        suspended
     }
 }
 
@@ -845,6 +633,11 @@ macro_rules! impl_write {
                         .try_fold(
                             (writer, resource_limiter),
                             |(mut writer, limiter), req| async move {
+                                if get_disk_status(0) != DiskUsage::Normal {
+                                    warn!("Upload failed due to not enough disk space");
+                                    return Err(Error::DiskSpaceNotEnough);
+                                }
+
                                 let batch = match req.chunk {
                                     Some($chunk_ty::Batch(b)) => b,
                                     _ => return Err(Error::InvalidChunk),
@@ -907,60 +700,69 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
     // future.
     fn switch_mode(
         &mut self,
-        ctx: RpcContext<'_>,
+        _ctx: RpcContext<'_>,
         mut req: SwitchModeRequest,
         sink: UnarySink<SwitchModeResponse>,
     ) {
         let label = "switch_mode";
+        IMPORT_RPC_COUNT.with_label_values(&[label]).inc();
         let timer = Instant::now_coarse();
+        let importer = self.importer.clone();
+        let tablets = self.tablets.clone();
 
-        let res = {
-            fn mf(cf: &str, name: &str, v: f64) {
-                CONFIG_ROCKSDB_GAUGE.with_label_values(&[cf, name]).set(v);
-            }
+        let task = async move {
+            let req_mode = req.get_mode();
+            let handle = tokio::task::spawn_blocking(move || {
+                fn mf(cf: &str, name: &str, v: f64) {
+                    CONFIG_ROCKSDB_GAUGE.with_label_values(&[cf, name]).set(v);
+                }
 
-            match &self.tablets {
-                LocalTablets::Singleton(tablet) => match req.get_mode() {
-                    SwitchMode::Normal => self.importer.enter_normal_mode(tablet.clone(), mf),
-                    SwitchMode::Import => self.importer.enter_import_mode(tablet.clone(), mf),
-                },
-                LocalTablets::Registry(_) => {
-                    if req.get_mode() == SwitchMode::Import {
-                        if !req.get_ranges().is_empty() {
-                            let ranges = req.take_ranges().to_vec();
-                            self.importer.ranges_enter_import_mode(ranges);
-                            Ok(true)
+                match tablets {
+                    LocalTablets::Singleton(tablet) => match req.get_mode() {
+                        SwitchMode::Normal => importer.enter_normal_mode(tablet, mf),
+                        SwitchMode::Import => importer.enter_import_mode(tablet, mf),
+                    },
+                    LocalTablets::Registry(_) => {
+                        if req.get_mode() == SwitchMode::Import {
+                            if !req.get_ranges().is_empty() {
+                                let ranges = req.take_ranges().to_vec();
+                                importer.ranges_enter_import_mode(ranges);
+                                Ok(true)
+                            } else {
+                                Err(sst_importer::Error::Engine(
+                                    "partitioned-raft-kv only support switch mode with range set"
+                                        .into(),
+                                ))
+                            }
                         } else {
-                            Err(sst_importer::Error::Engine(
-                                "partitioned-raft-kv only support switch mode with range set"
-                                    .into(),
-                            ))
-                        }
-                    } else {
-                        // case SwitchMode::Normal
-                        if !req.get_ranges().is_empty() {
-                            let ranges = req.take_ranges().to_vec();
-                            self.importer.clear_import_mode_regions(ranges);
-                            Ok(true)
-                        } else {
-                            Err(sst_importer::Error::Engine(
-                                "partitioned-raft-kv only support switch mode with range set"
-                                    .into(),
-                            ))
+                            // case SwitchMode::Normal
+                            if !req.get_ranges().is_empty() {
+                                let ranges = req.take_ranges().to_vec();
+                                importer.clear_import_mode_regions(ranges);
+                                Ok(true)
+                            } else {
+                                Err(sst_importer::Error::Engine(
+                                    "partitioned-raft-kv only support switch mode with range set"
+                                        .into(),
+                                ))
+                            }
                         }
                     }
                 }
+            });
+            match handle.await.map_err(|e| Error::Io(e.into())) {
+                Ok(res) => match res {
+                    Ok(_) => info!("switch mode"; "mode" => ?req_mode),
+                    Err(ref e) => warn!("switch mode failed"; "mode" => ?req_mode, "err" => %e),
+                },
+                Err(ref e) => {
+                    warn!("joining the background job failed"; "mode" => ?req_mode, "err" => %e)
+                }
             }
-        };
-        match res {
-            Ok(_) => info!("switch mode"; "mode" => ?req.get_mode()),
-            Err(ref e) => error!(%*e; "switch mode failed"; "mode" => ?req.get_mode(),),
-        }
-
-        let task = async move {
+            defer! { IMPORT_RPC_COUNT.with_label_values(&[label]).dec() }
             crate::send_rpc_response!(Ok(SwitchModeResponse::default()), sink, label, timer);
         };
-        ctx.spawn(task);
+        self.threads.spawn(task);
     }
 
     /// Receive SST from client and save the file for later ingesting.
@@ -989,6 +791,11 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
                 let file = import.create(meta)?;
                 let mut file = rx
                     .try_fold(file, |mut file, chunk| async move {
+                        if get_disk_status(0) != DiskUsage::Normal {
+                            warn!("Upload failed due to not enough disk space");
+                            return Err(Error::DiskSpaceNotEnough);
+                        }
+
                         let start = Instant::now_coarse();
                         let data = chunk.get_data();
                         if data.is_empty() {
@@ -1047,6 +854,7 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
     // store.
     fn apply(&mut self, _ctx: RpcContext<'_>, req: ApplyRequest, sink: UnarySink<ApplyResponse>) {
         let label = "apply";
+        IMPORT_RPC_COUNT.with_label_values(&[label]).inc();
         let start = Instant::now();
         let importer = self.importer.clone();
         let limiter = self.limiter.clone();
@@ -1054,6 +862,7 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
         let applier = self.writer.clone();
 
         let handle_task = async move {
+            defer! { IMPORT_RPC_COUNT.with_label_values(&[label]).dec() }
             // Records how long the apply task waits to be scheduled.
             sst_importer::metrics::IMPORTER_APPLY_DURATION
                 .with_label_values(&["queue"])
@@ -1062,17 +871,17 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
             let mut resp = ApplyResponse::default();
             if get_disk_status(0) != DiskUsage::Normal {
                 resp.set_error(Error::DiskSpaceNotEnough.into());
-                return crate::send_rpc_response!(Ok(resp), sink, label, start);
+                return send_rpc_response!(Ok(resp), sink, label, start);
             }
 
-            match Self::apply_imp(req, importer, applier, limiter, max_raft_size).await {
+            match Self::do_apply(req, importer, applier, limiter, max_raft_size).await {
                 Ok(Some(r)) => resp.set_range(r),
                 Err(e) => resp.set_error(e),
                 _ => {}
             }
 
             debug!("finished apply kv file with {:?}", resp);
-            crate::send_rpc_response!(Ok(resp), sink, label, start);
+            send_rpc_response!(Ok(resp), sink, label, start);
         };
         self.threads.spawn(handle_task);
     }
@@ -1085,6 +894,7 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
         sink: UnarySink<DownloadResponse>,
     ) {
         let label = "download";
+        IMPORT_RPC_COUNT.with_label_values(&[label]).inc();
         let timer = Instant::now_coarse();
         let importer = Arc::clone(&self.importer);
         let limiter = self.limiter.clone();
@@ -1101,6 +911,7 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
         });
 
         let handle_task = async move {
+            defer! { IMPORT_RPC_COUNT.with_label_values(&[label]).dec() }
             // Records how long the download task waits to be scheduled.
             sst_importer::metrics::IMPORTER_DOWNLOAD_DURATION
                 .with_label_values(&["queue"])
@@ -1135,7 +946,7 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
             };
 
             let res = with_resource_limiter(
-                importer.download_ext::<E::Local>(
+                importer.download_ext(
                     req.get_sst(),
                     req.get_storage_backend(),
                     req.get_name(),
@@ -1170,56 +981,38 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
     /// CleanupSstWorker.
     fn ingest(
         &mut self,
-        ctx: RpcContext<'_>,
+        _: RpcContext<'_>,
         mut req: IngestRequest,
         sink: UnarySink<IngestResponse>,
     ) {
         let label = "ingest";
+        IMPORT_RPC_COUNT.with_label_values(&[label]).inc();
         let timer = Instant::now_coarse();
-        let mut resp = IngestResponse::default();
+        let import = self.importer.clone();
+        let engine = self.engine.clone();
+        let suspend = self.suspend.clone();
+        let tablets = self.tablets.clone();
+        let store_meta = self.store_meta.clone();
+        let ingest_latch = self.ingest_latch.clone();
+        let ingest_admission_guard = self.ingest_admission_guard.clone();
 
-        if let Err(err) = self.check_suspend() {
-            resp.set_error(ImportPbError::from(err).take_store_error());
-            ctx.spawn(async move { crate::send_rpc_response!(Ok(resp), sink, label, timer) });
-            return;
-        }
-
-        let mut errorpb = errorpb::Error::default();
-        {
-            // Serialize admission checks to avoid race conditions between
-            // concurrent ingests.
-            let _guard = self.ingest_admission_guard.lock().unwrap();
-
-            let region_id = req.get_context().get_region_id();
-            if let Some(errorpb) = self.check_write_stall(
-                region_id,
-                Self::count_ssts_in_cf(&self.task_slots, CF_WRITE) as u64,
-            ) {
-                resp.set_error(errorpb);
-                ctx.spawn(
-                    sink.success(resp)
-                        .unwrap_or_else(|e| warn!("send rpc failed"; "err" => %e)),
-                );
-                return;
-            }
-
-            if !Self::acquire_lock(&self.task_slots, req.get_sst()).unwrap_or(false) {
-                errorpb.set_message(Error::FileConflict.to_string());
-                resp.set_error(errorpb);
-                ctx.spawn(
-                    sink.success(resp)
-                        .unwrap_or_else(|e| warn!("send rpc failed"; "err" => %e)),
-                );
-                return;
-            }
-        }
-
-        let task_slots = self.task_slots.clone();
-        let meta = req.take_sst();
-        let f = self.ingest_files(req.take_context(), label, vec![meta.clone()]);
         let handle_task = async move {
-            let res = f.await;
-            Self::release_lock(&task_slots, &meta).unwrap();
+            defer! { IMPORT_RPC_COUNT.with_label_values(&[label]).dec() }
+            let mut multi_ingest = MultiIngestRequest::default();
+            multi_ingest.set_context(req.take_context());
+            multi_ingest.mut_ssts().push(req.take_sst());
+            let res = ingest(
+                multi_ingest,
+                engine,
+                &suspend,
+                &tablets,
+                &store_meta,
+                &import,
+                &ingest_latch,
+                &ingest_admission_guard,
+                label,
+            )
+            .await;
             crate::send_rpc_response!(res, sink, label, timer);
         };
         self.threads.spawn(handle_task);
@@ -1228,64 +1021,35 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
     /// Ingest multiple files by sending a raft command to raftstore.
     fn multi_ingest(
         &mut self,
-        ctx: RpcContext<'_>,
-        mut req: MultiIngestRequest,
+        _: RpcContext<'_>,
+        req: MultiIngestRequest,
         sink: UnarySink<IngestResponse>,
     ) {
         let label = "multi-ingest";
+        IMPORT_RPC_COUNT.with_label_values(&[label]).inc();
         let timer = Instant::now_coarse();
-        let mut resp = IngestResponse::default();
-        if let Err(err) = self.check_suspend() {
-            resp.set_error(ImportPbError::from(err).take_store_error());
-            ctx.spawn(async move { crate::send_rpc_response!(Ok(resp), sink, label, timer) });
-            return;
-        }
+        let import = self.importer.clone();
+        let engine = self.engine.clone();
+        let suspend = self.suspend.clone();
+        let tablets = self.tablets.clone();
+        let store_meta = self.store_meta.clone();
+        let ingest_latch = self.ingest_latch.clone();
+        let ingest_admission_guard = self.ingest_admission_guard.clone();
 
-        let mut errorpb = errorpb::Error::default();
-        let mut metas = vec![];
-        {
-            // Serialize admission checks to avoid race conditions between
-            // concurrent ingests.
-            let _guard = self.ingest_admission_guard.lock().unwrap();
-
-            let region_id = req.get_context().get_region_id();
-            if let Some(errorpb) = self.check_write_stall(
-                region_id,
-                Self::count_ssts_in_cf(&self.task_slots, CF_WRITE) as u64,
-            ) {
-                resp.set_error(errorpb);
-                ctx.spawn(
-                    sink.success(resp)
-                        .unwrap_or_else(|e| warn!("send rpc failed"; "err" => %e)),
-                );
-                return;
-            }
-
-            for sst in req.get_ssts() {
-                if Self::acquire_lock(&self.task_slots, sst).unwrap_or(false) {
-                    metas.push(sst.clone());
-                }
-            }
-        }
-        if metas.len() < req.get_ssts().len() {
-            for m in metas {
-                Self::release_lock(&self.task_slots, &m).unwrap();
-            }
-            errorpb.set_message(Error::FileConflict.to_string());
-            resp.set_error(errorpb);
-            ctx.spawn(
-                sink.success(resp)
-                    .unwrap_or_else(|e| warn!("send rpc failed"; "err" => %e)),
-            );
-            return;
-        }
-        let task_slots = self.task_slots.clone();
-        let f = self.ingest_files(req.take_context(), label, req.take_ssts().into());
         let handle_task = async move {
-            let res = f.await;
-            for m in metas {
-                Self::release_lock(&task_slots, &m).unwrap();
-            }
+            defer! { IMPORT_RPC_COUNT.with_label_values(&[label]).dec() }
+            let res = ingest(
+                req,
+                engine,
+                &suspend,
+                &tablets,
+                &store_meta,
+                &import,
+                &ingest_latch,
+                &ingest_admission_guard,
+                label,
+            )
+            .await;
             crate::send_rpc_response!(res, sink, label, timer);
         };
         self.threads.spawn(handle_task);
@@ -1395,7 +1159,7 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
             Some(request.take_end_key())
         };
         let key_only = request.get_key_only();
-        let snap_res = Self::async_snapshot(&mut self.engine, &context);
+        let snap_res = async_snapshot(&mut self.engine, &context);
         let handle_task = async move {
             let res = snap_res.await;
             let snapshot = match res {
@@ -1473,7 +1237,7 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
             ctx.spawn(async move {
                 send_rpc_response!(Err(Error::Io(
                     std::io::Error::new(std::io::ErrorKind::InvalidInput,
-                        format!("you are going to suspend the import RPCs too long. (for {} seconds, max acceptable duration is {} seconds)", 
+                        format!("you are going to suspend the import RPCs too long. (for {} seconds, max acceptable duration is {} seconds)",
                         req.get_duration_in_secs(), SUSPEND_REQUEST_MAX_SECS)))), sink, label, timer);
             });
             return;
@@ -1481,40 +1245,119 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
 
         let suspended = if req.should_suspend_imports {
             info!("suspend incoming import RPCs."; "for_second" => req.get_duration_in_secs(), "caller" => req.get_caller());
-            self.suspend_requests(Duration::from_secs(req.get_duration_in_secs()))
+            self.suspend
+                .suspend_requests(Duration::from_secs(req.get_duration_in_secs()))
         } else {
             info!("allow incoming import RPCs."; "caller" => req.get_caller());
-            self.allow_requests()
+            self.suspend.allow_requests()
         };
         let mut resp = SuspendImportRpcResponse::default();
         resp.set_already_suspended(suspended);
         ctx.spawn(async move { send_rpc_response!(Ok(resp), sink, label, timer) });
     }
-}
 
-// add error statistics from pb error response
-fn pb_error_inc(type_: &str, e: &errorpb::Error) {
-    let label = if e.has_not_leader() {
-        "not_leader"
-    } else if e.has_store_not_match() {
-        "store_not_match"
-    } else if e.has_region_not_found() {
-        "region_not_found"
-    } else if e.has_key_not_in_region() {
-        "key_not_in_range"
-    } else if e.has_epoch_not_match() {
-        "epoch_not_match"
-    } else if e.has_server_is_busy() {
-        "server_is_busy"
-    } else if e.has_stale_command() {
-        "stale_command"
-    } else if e.has_raft_entry_too_large() {
-        "raft_entry_too_large"
-    } else {
-        "unknown"
-    };
+    fn add_force_partition_range(
+        &mut self,
+        _ctx: RpcContext<'_>,
+        req: AddPartitionRangeRequest,
+        sink: UnarySink<AddPartitionRangeResponse>,
+    ) {
+        let label = "add_force_partition_range";
+        let timer = Instant::now_coarse();
+        let kv_engine = self.engine.kv_engine();
+        let force_partition_range_mgr = self.force_partition_range_mgr.clone();
 
-    IMPORTER_ERROR_VEC.with_label_values(&[type_, label]).inc();
+        let handle_task = async move {
+            let resp = AddPartitionRangeResponse::default();
+            let engine = if let Some(eng) = kv_engine {
+                eng
+            } else {
+                info!("ignore add_force_partition_range request on raftstore-v2 cluster");
+                // engine is none means this is raftstore-v2, then we can just return.
+                send_rpc_response!(Ok(resp), sink, label, timer);
+                return;
+            };
+            let start = keys::data_key(Key::from_raw(req.get_range().get_start()).as_encoded());
+            let end = keys::data_end_key(Key::from_raw(req.get_range().get_end()).as_encoded());
+            let mut ttl_seconds = req.get_ttl_seconds();
+            if ttl_seconds == 0 {
+                // default value if the ttl is not set, 1h is big enough for most cases.
+                ttl_seconds = DEFAULT_FORCE_PARTITION_RANGE_TTL_SECONDS;
+            }
+            if start >= end {
+                send_rpc_response!(
+                    Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "start keys must be smaller than end key, start: {:?}, end: {:?}",
+                            req.get_range().get_start(),
+                            req.get_range().get_end()
+                        )
+                    ))),
+                    sink,
+                    label,
+                    timer
+                );
+                return;
+            }
+
+            let added =
+                force_partition_range_mgr.add_range(start.clone(), end.clone(), ttl_seconds);
+
+            // here, we don't compact the whole range directly because it's possible that
+            // the task is restart from a checkpoint, thus, there may be already
+            // many SST files, but there's no need to compact them. Instaed, we
+            // try to compact a range that won't overlap with any real data kv
+            // at both side of the range. These 2 ranges won't overlap with any real
+            // data kv, but can trigger a compact if a SST with huge range overlaps with the
+            // input range.
+            let mut start_next = req.get_range().get_start().to_owned();
+            start_next.push(0);
+            let start_next_data_key = keys::data_key(Key::from_raw(&start_next).as_encoded());
+            let mut end_next = req.get_range().get_end().to_owned();
+            end_next.push(0);
+            let end_next_data_key = keys::data_key(Key::from_raw(&end_next).as_encoded());
+            let opts = ManualCompactionOptions::new(false, 1, true);
+            for cf in [CF_WRITE, CF_DEFAULT] {
+                for rg in [(&*start, &*start_next_data_key), (&end, &end_next_data_key)] {
+                    let start = Instant::now_coarse();
+                    let start_key = log_wrappers::Value::key(req.get_range().get_start());
+                    let end_key = log_wrappers::Value::key(req.get_range().get_end());
+                    let res = engine.compact_range_cf(cf, Some(rg.0), Some(rg.1), opts.clone());
+                    let dur = start.saturating_elapsed();
+                    if let Err(e) = res {
+                        warn!("manual compact range failed"; "cf" => cf, "start" => ?start_key, "end" => ?end_key, "err" => ?e, "dur" => ?dur);
+                    } else {
+                        info!("manual compact range success"; "cf" => cf, "start" => ?start_key, "end" => ?end_key, "dur" => ?dur);
+                    }
+                }
+            }
+
+            info!("add force_partition range"; "start" => ?log_wrappers::Value::key(req.get_range().get_start()),
+                    "end" => ?log_wrappers::Value::key(req.get_range().get_end()), "ttl" => ttl_seconds, "added" => added);
+            send_rpc_response!(Ok(resp), sink, label, timer);
+        };
+
+        self.threads.spawn(handle_task);
+    }
+    fn remove_force_partition_range(
+        &mut self,
+        ctx: RpcContext<'_>,
+        req: RemovePartitionRangeRequest,
+        sink: UnarySink<RemovePartitionRangeResponse>,
+    ) {
+        let label = "remove_force_partition_range";
+        let timer = Instant::now_coarse();
+
+        let start = keys::data_key(Key::from_raw(req.get_range().get_start()).as_encoded());
+        let end = keys::data_end_key(Key::from_raw(req.get_range().get_end()).as_encoded());
+        let removed = self.force_partition_range_mgr.remove_range(&start, &end);
+        info!("remove force_partition range"; "start" => log_wrappers::Value::key(req.get_range().get_start()),
+                "end" => log_wrappers::Value::key(req.get_range().get_end()), "removed" => removed);
+
+        let resp = RemovePartitionRangeResponse::default();
+        ctx.spawn(async move { send_rpc_response!(Ok(resp), sink, label, timer) });
+    }
 }
 
 fn write_needs_restore(write: &[u8]) -> bool {

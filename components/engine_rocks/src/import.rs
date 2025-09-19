@@ -3,10 +3,14 @@
 use engine_traits::{ImportExt, IngestExternalFileOptions, Range, Result};
 use fail::fail_point;
 use rocksdb::IngestExternalFileOptions as RawIngestExternalFileOptions;
-use tikv_util::range_latch::RangeLatchGuard;
+use tikv_util::{range_latch::RangeLatchGuard, time::Instant};
 
 use crate::{
-    engine::RocksEngine, perf_context_metrics::INGEST_EXTERNAL_FILE_ALLOW_WRITE_COUNTER, r2e, util,
+    engine::RocksEngine,
+    perf_context_metrics::{
+        INGEST_EXTERNAL_FILE_ALLOW_WRITE_COUNTER, INGEST_EXTERNAL_FILE_TIME_HISTOGRAM,
+    },
+    r2e, util,
 };
 
 impl ImportExt for RocksEngine {
@@ -44,16 +48,31 @@ impl ImportExt for RocksEngine {
             not_allow_write"])
                 .inc();
         }
+
         // Note: no need reset the global seqno to 0 for compatibility as #16992
+        // enable the TiKV to handle the case on applying abnormal snapshot.
+        let now = Instant::now_coarse();
         // This is calling a specially optimized version of
         // ingest_external_file_cf. In cases where the memtable needs to be
-        // flushed it avoids blocking writers while doing the flush. The unused
+        // flushed it avoids blocking writers while doing the flush. The
         // return value here just indicates whether the fallback path requiring
         // the manual memtable flush was taken.
-        let _did_nonblocking_memtable_flush = self
+        let did_memtable_flush = self
             .as_inner()
             .ingest_external_file_optimized(cf, &opts.0, files)
             .map_err(r2e)?;
+        let time_cost = now.saturating_elapsed_secs();
+        if did_memtable_flush {
+            INGEST_EXTERNAL_FILE_TIME_HISTOGRAM
+                .get(cf_name.into())
+                .block
+                .observe(time_cost);
+        } else {
+            INGEST_EXTERNAL_FILE_TIME_HISTOGRAM
+                .get(cf_name.into())
+                .non_block
+                .observe(time_cost);
+        }
         Ok(())
     }
 

@@ -29,12 +29,15 @@ command! {
     /// status being changed, a rollback may be written.
     CheckSecondaryLocks:
         cmd_ty => SecondaryLocksStatus,
-        display => "kv::command::CheckSecondaryLocks {:?} keys@{} | {:?}", (keys, start_ts, ctx),
+        display => { "kv::command::CheckSecondaryLocks {:?} keys@{} | {:?}", (keys, start_ts, ctx), }
         content => {
             /// The keys of secondary locks.
             keys: Vec<Key>,
             /// The start timestamp of the transaction.
             start_ts: txn_types::TimeStamp,
+        }
+        in_heap => {
+            keys,
         }
 }
 
@@ -237,6 +240,8 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for CheckSecondaryLocks {
 
 #[cfg(test)]
 pub mod tests {
+    use std::sync::Arc;
+
     use concurrency_manager::ConcurrencyManager;
     use kvproto::kvrpcpb::Context;
     use tikv_util::deadline::Deadline;
@@ -279,7 +284,7 @@ pub mod tests {
                     statistics: &mut Default::default(),
                     async_apply_prewrite: false,
                     raw_ext: None,
-                    txn_status_cache: &TxnStatusCache::new_for_test(),
+                    txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
                 },
             )
             .unwrap();
@@ -318,7 +323,7 @@ pub mod tests {
                         statistics: &mut Default::default(),
                         async_apply_prewrite: false,
                         raw_ext: None,
-                        txn_status_cache: &TxnStatusCache::new_for_test(),
+                        txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
                     },
                 )
                 .unwrap();

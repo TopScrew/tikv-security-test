@@ -1,6 +1,7 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
 mod binary;
+mod gb18030_collation;
 mod gbk_collation;
 mod latin1_bin;
 mod utf8mb4_binary;
@@ -10,11 +11,11 @@ mod utf8mb4_uca;
 use std::{
     cmp::Ordering,
     hash::{Hash, Hasher},
-    str,
 };
 
 pub use binary::*;
 use codec::prelude::*;
+pub use gb18030_collation::*;
 pub use gbk_collation::*;
 pub use latin1_bin::*;
 pub use utf8mb4_binary::*;
@@ -25,6 +26,29 @@ use super::{charset::*, Collator};
 use crate::codec::Result;
 
 pub const PADDING_SPACE: char = 0x20 as char;
+
+pub(crate) fn trim_end_padding(mut s: &[u8]) -> &[u8] {
+    while s.ends_with(&[PADDING_SPACE as u8]) {
+        s = &s[..s.len() - 1];
+    }
+    s
+}
+
+pub(crate) fn next_utf8_char(s: &[u8]) -> Option<(char, &[u8])> {
+    let len = match s.first()? {
+        0x00..=0x7F => 1,
+        0xC2..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        _ => return None,
+    };
+    if s.len() < len {
+        return None;
+    }
+    let (head, tail) = s.split_at(len);
+    let ch = std::str::from_utf8(head).ok()?.chars().next()?;
+    Some((ch, tail))
+}
 
 #[cfg(test)]
 mod tests {
@@ -45,6 +69,8 @@ mod tests {
             (Collation::GbkChineseCi, 6),
             (Collation::Utf8Mb40900AiCi, 7),
             (Collation::Utf8Mb40900Bin, 8),
+            (Collation::Gb18030Bin, 9),
+            (Collation::Gb18030ChineseCi, 10),
         ];
         let cases = vec![
             // (sa, sb, [Utf8Mb4Bin, Utf8Mb4BinNoPadding, Utf8Mb4GeneralCi, Utf8Mb4UnicodeCi,
@@ -53,6 +79,8 @@ mod tests {
                 "a".as_bytes(),
                 "a".as_bytes(),
                 [
+                    Ordering::Equal,
+                    Ordering::Equal,
                     Ordering::Equal,
                     Ordering::Equal,
                     Ordering::Equal,
@@ -77,6 +105,8 @@ mod tests {
                     Ordering::Equal,
                     Ordering::Less,
                     Ordering::Less,
+                    Ordering::Equal,
+                    Ordering::Equal,
                 ],
             ),
             (
@@ -92,12 +122,16 @@ mod tests {
                     Ordering::Equal,
                     Ordering::Less,
                     Ordering::Greater,
+                    Ordering::Greater,
+                    Ordering::Equal,
                 ],
             ),
             (
                 "aa ".as_bytes(),
                 "a a".as_bytes(),
                 [
+                    Ordering::Greater,
+                    Ordering::Greater,
                     Ordering::Greater,
                     Ordering::Greater,
                     Ordering::Greater,
@@ -122,6 +156,8 @@ mod tests {
                     Ordering::Less,
                     Ordering::Less,
                     Ordering::Less,
+                    Ordering::Less,
+                    Ordering::Less,
                 ],
             ),
             (
@@ -136,6 +172,8 @@ mod tests {
                     Ordering::Less,
                     Ordering::Less,
                     Ordering::Equal,
+                    Ordering::Less,
+                    Ordering::Less,
                     Ordering::Less,
                 ],
             ),
@@ -152,6 +190,8 @@ mod tests {
                     Ordering::Less,
                     Ordering::Greater,
                     Ordering::Less,
+                    Ordering::Less,
+                    Ordering::Less,
                 ],
             ),
             (
@@ -166,6 +206,8 @@ mod tests {
                     Ordering::Less,
                     Ordering::Less,
                     Ordering::Equal,
+                    Ordering::Greater,
+                    Ordering::Greater,
                     Ordering::Greater,
                 ],
             ),
@@ -182,6 +224,8 @@ mod tests {
                     Ordering::Greater,
                     Ordering::Less,
                     Ordering::Less,
+                    Ordering::Greater,
+                    Ordering::Greater,
                 ],
             ),
             (
@@ -197,6 +241,42 @@ mod tests {
                     Ordering::Less,
                     Ordering::Less,
                     Ordering::Less,
+                    Ordering::Less,
+                    Ordering::Less,
+                ],
+            ),
+            (
+                &[0x3e, 0xfe, 0x3e, 0x3e],
+                &[0x3e, 0xff],
+                [
+                    Ordering::Less,
+                    Ordering::Less,
+                    Ordering::Equal,
+                    Ordering::Equal,
+                    Ordering::Less,
+                    Ordering::Greater,
+                    Ordering::Equal,
+                    Ordering::Equal,
+                    Ordering::Less,
+                    Ordering::Greater,
+                    Ordering::Equal,
+                ],
+            ),
+            (
+                "ʩ".as_bytes(),
+                "F".as_bytes(),
+                [
+                    Ordering::Greater,
+                    Ordering::Greater,
+                    Ordering::Greater,
+                    Ordering::Greater,
+                    Ordering::Greater,
+                    Ordering::Less, // `ʩ` is invalid character in GBK.
+                    Ordering::Less, // `ʩ` is invalid character in GBK.
+                    Ordering::Greater,
+                    Ordering::Greater,
+                    Ordering::Greater,
+                    Ordering::Greater,
                 ],
             ),
         ];
@@ -212,7 +292,7 @@ mod tests {
                                 hasher.finish()
                             };
 
-                            let cmp = TT::sort_compare(sa, sb).unwrap();
+                            let cmp = TT::sort_compare(sa, sb, false).unwrap();
                             let ha = eval_hash(sa);
                             let hb = eval_hash(sb);
                             (cmp, ha, hb)
@@ -255,6 +335,8 @@ mod tests {
             (Collation::GbkChineseCi, 6),
             (Collation::Utf8Mb40900AiCi, 7),
             (Collation::Utf8Mb40900Bin, 8),
+            (Collation::Gb18030Bin, 9),
+            (Collation::Gb18030ChineseCi, 10),
         ];
         let cases = vec![
             // (str, [Utf8Mb4Bin, Utf8Mb4BinNoPadding, Utf8Mb4GeneralCi, Utf8Mb4UnicodeCi, Latin1,
@@ -271,6 +353,8 @@ mod tests {
                     vec![0x41],
                     vec![0x1C, 0x47],
                     vec![0x61],
+                    vec![0x61],
+                    vec![0x41],
                 ],
             ),
             (
@@ -285,6 +369,8 @@ mod tests {
                     vec![0x41],
                     vec![0x1C, 0x47, 0x2, 0x9],
                     vec![0x41, 0x20],
+                    vec![0x41],
+                    vec![0x41],
                 ],
             ),
             (
@@ -298,6 +384,8 @@ mod tests {
                     vec![0x41],
                     vec![0x41],
                     vec![0x1C, 0x47],
+                    vec![0x41],
+                    vec![0x41],
                     vec![0x41],
                 ],
             ),
@@ -313,6 +401,8 @@ mod tests {
                     vec![0x3F],
                     vec![0x15, 0xFE],
                     vec![0xF0, 0x9F, 0x98, 0x83],
+                    vec![0x94, 0x39, 0xFC, 0x39],
+                    vec![0xFF, 0x03, 0xD8, 0x4B],
                 ],
             ),
             (
@@ -364,6 +454,16 @@ mod tests {
                         0x9D, 0x8C, 0x86, 0x20, 0x62, 0x61, 0x7A, 0x20, 0xE2, 0x98, 0x83, 0x20,
                         0x71, 0x75, 0x78,
                     ],
+                    vec![
+                        0x46, 0x6F, 0x6F, 0x20, 0x81, 0x30, 0x84, 0x38, 0x20, 0x62, 0x61, 0x72,
+                        0x20, 0x94, 0x32, 0xEF, 0x32, 0x20, 0x62, 0x61, 0x7A, 0x20, 0x81, 0x37,
+                        0xA3, 0x30, 0x20, 0x71, 0x75, 0x78,
+                    ],
+                    vec![
+                        0x46, 0x4F, 0x4F, 0x20, 0xFF, 0x00, 0x00, 0x26, 0x20, 0x42, 0x41, 0x52,
+                        0x20, 0xFF, 0x03, 0xB5, 0x4E, 0x20, 0x42, 0x41, 0x5A, 0x20, 0xFF, 0x00,
+                        0x23, 0xC8, 0x20, 0x51, 0x55, 0x58,
+                    ],
                 ],
             ),
             (
@@ -384,6 +484,8 @@ mod tests {
                         0x9C, 0x23, 0xB1,
                     ],
                     vec![0xEF, 0xB7, 0xBB],
+                    vec![0x84, 0x30, 0xFE, 0x35],
+                    vec![0xFF, 0x00, 0x98, 0x8F],
                 ],
             ),
             (
@@ -398,6 +500,8 @@ mod tests {
                     vec![0xD3, 0x21, 0xC1, 0xAD],
                     vec![0xFB, 0x40, 0xCE, 0x2D, 0xFB, 0x40, 0xE5, 0x87],
                     vec![0xE4, 0xB8, 0xAD, 0xE6, 0x96, 0x87],
+                    vec![0xD6, 0xD0, 0xCE, 0xC4],
+                    vec![0xFF, 0xA0, 0x9B, 0xC1, 0xFF, 0xA0, 0x78, 0xBD],
                 ],
             ),
         ];
@@ -448,7 +552,7 @@ mod tests {
                 hasher.finish()
             };
 
-            let cmp = CollatorLatin1Bin::sort_compare(sa.as_slice(), sb.as_slice()).unwrap();
+            let cmp = CollatorLatin1Bin::sort_compare(sa.as_slice(), sb.as_slice(), false).unwrap();
             let ha = eval_hash(sa.as_slice());
             let hb = eval_hash(sb.as_slice());
 

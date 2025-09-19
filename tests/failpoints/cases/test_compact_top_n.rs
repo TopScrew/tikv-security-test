@@ -16,7 +16,7 @@ use tikv_util::config::ReadableDuration;
 
 #[test]
 fn test_check_then_compact_top_n_with_failpoints() {
-    let (mut cluster, client, _ctx) = must_new_and_configure_cluster_and_kv_client(|cluster| {
+    let (mut cluster, client, _ctx) = must_new_cluster_with_cfg_and_kv_client_mul(1, |cluster| {
         cluster.cfg.rocksdb.writecf.disable_auto_compactions = true;
         cluster.cfg.raft_store.region_compact_check_interval = ReadableDuration::millis(100);
         cluster.cfg.raft_store.check_then_compact_top_n = 3; // Compact top 3 candidates

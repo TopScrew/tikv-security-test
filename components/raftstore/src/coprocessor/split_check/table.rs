@@ -300,7 +300,7 @@ mod tests {
             // ["t1", "") => t2_xx
             (Some(1), None, data_keys.get(1).cloned()),
             // ["t1", "t2") => t1_xx
-            (Some(1), Some(2), data_keys.get(0).cloned()),
+            (Some(1), Some(2), data_keys.first().cloned()),
         ]);
     }
 
@@ -335,7 +335,7 @@ mod tests {
 
         // Try to ignore the ApproximateRegionSize
         let coprocessor = CoprocessorHost::new(stx, cfg);
-        let mut runnable = SplitCheckRunner::new(None, engine.clone(), tx, coprocessor);
+        let mut runnable = SplitCheckRunner::new(engine.clone(), tx, coprocessor, None);
 
         type Case = (Option<Vec<u8>>, Option<Vec<u8>>, Option<i64>);
         let mut check_cases = |cases: Vec<Case>| {

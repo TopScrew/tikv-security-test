@@ -29,6 +29,7 @@ use std::{
 
 use crossbeam::atomic::AtomicCell;
 use lazy_static::lazy_static;
+use mockall::automock;
 use pd_client::{PdClient, PdFuture};
 use prometheus::{register_int_gauge, IntGauge};
 use thiserror::Error;
@@ -69,11 +70,12 @@ struct MaxTsLimit {
     update_time: Instant,
 }
 
-pub trait TsoProvider: Send + Sync {
+#[automock]
+pub trait TSOProvider: Send + Sync {
     fn get_tso(&self) -> PdFuture<TimeStamp>;
 }
 
-impl<T: PdClient> TsoProvider for T {
+impl<T: PdClient> TSOProvider for T {
     fn get_tso(&self) -> PdFuture<TimeStamp> {
         PdClient::get_tso(self)
     }
@@ -99,7 +101,7 @@ pub struct ConcurrencyManager {
 
     max_ts_drift_allowance_ms: Arc<AtomicU64>,
 
-    tso: Option<Arc<dyn TsoProvider>>,
+    tso: Option<Arc<dyn TSOProvider>>,
 
     time_provider: Arc<dyn TimeProvider>,
 }
@@ -119,7 +121,7 @@ impl ConcurrencyManager {
         latest_ts: TimeStamp,
         limit_valid_duration: Duration,
         action_on_invalid_max_ts: ActionOnInvalidMaxTs,
-        tso: Option<Arc<dyn TsoProvider>>,
+        tso: Option<Arc<dyn TSOProvider>>,
         max_ts_drift_allowance: Duration,
     ) -> Self {
         let initial_limit = MaxTsLimit {
@@ -157,7 +159,7 @@ impl ConcurrencyManager {
         limit_valid_duration: Duration,
         action_on_invalid_max_ts: ActionOnInvalidMaxTs,
         time_provider: Arc<dyn TimeProvider>,
-        tso: Option<Arc<dyn TsoProvider>>,
+        tso: Option<Arc<dyn TSOProvider>>,
         max_ts_drift_allowance: Duration,
     ) -> Self {
         let initial_limit = MaxTsLimit {
@@ -642,36 +644,6 @@ mod tests {
         }
     }
 
-    #[derive(Clone)]
-    struct StubTsoProvider {
-        current_tso: Arc<Mutex<TimeStamp>>,
-        pending: bool,
-    }
-
-    impl StubTsoProvider {
-        fn new(start_tso: TimeStamp) -> Self {
-            StubTsoProvider {
-                current_tso: Arc::new(Mutex::new(start_tso)),
-                pending: false,
-            }
-        }
-
-        fn set_pending(&mut self) {
-            self.pending = true
-        }
-    }
-
-    impl TsoProvider for StubTsoProvider {
-        fn get_tso(&self) -> PdFuture<TimeStamp> {
-            if self.pending {
-                std::future::pending().boxed()
-            } else {
-                let current_tso = self.current_tso.lock().unwrap();
-                ready(Ok(*current_tso)).boxed()
-            }
-        }
-    }
-
     #[tokio::test]
     async fn test_lock_keys_order() {
         let concurrency_manager = ConcurrencyManager::new(1.into());
@@ -750,7 +722,10 @@ mod tests {
 
     #[test]
     fn test_max_ts_limit() {
-        let stub_pd = StubTsoProvider::new(160.into());
+        let mut stub_pd = MockTSOProvider::new();
+        stub_pd
+            .expect_get_tso()
+            .return_once(|| ready(Ok(160.into())).boxed());
         let stub_pd = Arc::new(stub_pd);
         let cm = ConcurrencyManager::new_with_config(
             TimeStamp::new(100),
@@ -795,8 +770,11 @@ mod tests {
 
     #[test]
     fn test_max_ts_updates_with_monotonic_limit() {
+        let mut stub_pd = MockTSOProvider::new();
         // Assertion: should fail to update max_ts to 250 and query PD
-        let stub_pd = StubTsoProvider::new(201.into());
+        stub_pd
+            .expect_get_tso()
+            .return_once(|| ready(Ok(201.into())).boxed());
         let stub_pd = Arc::new(stub_pd);
         let cm = ConcurrencyManager::new_with_config(
             TimeStamp::new(100),
@@ -829,8 +807,11 @@ mod tests {
     fn test_limit_valid_duration_boundary() {
         let start_time = Instant::now();
         let stub_time = StubTimeProvider::new(start_time);
-        let time_provider = Arc::new(stub_time);
-        let stub_pd = StubTsoProvider::new(200.into());
+        let time_provider = Arc::new(stub_time.clone());
+        let mut stub_pd = MockTSOProvider::new();
+        stub_pd
+            .expect_get_tso()
+            .return_once(|| ready(Ok(200.into())).boxed());
         let stub_pd = Arc::new(stub_pd);
 
         let cm = ConcurrencyManager::new_with_time_provider(
@@ -861,7 +842,7 @@ mod tests {
             TimeStamp::new(100),
             Duration::from_secs(60),
             ActionOnInvalidMaxTs::Error,
-            time_provider,
+            time_provider.clone(),
             None,
             Duration::ZERO,
         );
@@ -879,7 +860,10 @@ mod tests {
     #[test]
     #[should_panic(expected = "invalid max_ts update")]
     fn test_panic_on_invalid_max_ts_enabled() {
-        let stub_pd = StubTsoProvider::new(201.into());
+        let mut stub_pd = MockTSOProvider::new();
+        stub_pd
+            .expect_get_tso()
+            .return_once(|| ready(Ok(201.into())).boxed());
         let stub_pd = Arc::new(stub_pd);
         let cm = ConcurrencyManager::new_with_config(
             TimeStamp::new(100),
@@ -907,14 +891,17 @@ mod tests {
 
     #[test]
     fn test_pd_tso_jump_not_panic() {
+        let mut stub_pd = MockTSOProvider::new();
         // The double check procedure gets latest_ts=300 from TSO
-        let stub_pd = StubTsoProvider::new(300.into());
+        stub_pd
+            .expect_get_tso()
+            .return_once(|| ready(Ok(300.into())).boxed());
         let stub_pd = Arc::new(stub_pd);
         let cm = ConcurrencyManager::new_with_config(
             TimeStamp::new(100),
             DEFAULT_LIMIT_VALID_DURATION,
             ActionOnInvalidMaxTs::Panic,
-            Some(stub_pd),
+            Some(stub_pd.clone()),
             Duration::ZERO,
         );
 
@@ -926,15 +913,17 @@ mod tests {
 
     #[test]
     fn test_do_not_panic_under_pd_tso_jump_and_network_partition() {
-        let mut stub_pd = StubTsoProvider::new(300.into());
-        stub_pd.set_pending();
+        let mut stub_pd = MockTSOProvider::new();
         // Network partition between PD and TiKV
+        stub_pd
+            .expect_get_tso()
+            .return_once(|| std::future::pending().boxed());
         let stub_pd = Arc::new(stub_pd);
         let cm = ConcurrencyManager::new_with_config(
             TimeStamp::new(100),
             DEFAULT_LIMIT_VALID_DURATION,
             ActionOnInvalidMaxTs::Panic,
-            Some(stub_pd),
+            Some(stub_pd.clone()),
             Duration::ZERO,
         );
         cm.set_max_ts_limit(200.into());

@@ -67,8 +67,7 @@ mod all {
             .into_iter()
             .find(|v| {
                 v.as_ref()
-                    .map(|v| v.file_name().as_bytes().ends_with(b".meta"))
-                    .map_or(false, |b| b)
+                    .is_ok_and(|v| v.file_name().as_bytes().ends_with(b".meta"))
             })
             .unwrap()
             .unwrap();

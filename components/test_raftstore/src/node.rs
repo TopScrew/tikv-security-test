@@ -1,16 +1,17 @@
 // Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{atomic::AtomicU64, Arc, Mutex, RwLock},
 };
 
 use collections::{HashMap, HashSet};
 use concurrency_manager::ConcurrencyManager;
 use encryption_export::DataKeyManager;
-use engine_rocks::{RocksEngine, RocksSnapshot};
+use engine_rocks::{util, RocksEngine, RocksSnapshot};
 use engine_test::raft::RaftTestEngine;
 use engine_traits::{Engines, MiscExt, Peekable};
+use health_controller::HealthController;
 use kvproto::{
     kvrpcpb::ApiVersion,
     metapb,
@@ -22,10 +23,10 @@ use raft::{eraftpb::MessageType, SnapshotStatus};
 use raftstore::{
     coprocessor::{config::SplitCheckConfigManager, CoprocessorHost},
     errors::Error as RaftError,
-    router::{LocalReadRouter, RaftStoreRouter, ServerRaftStoreRouter},
+    router::{LocalReadRouter, RaftStoreRouter, ReadContext, ServerRaftStoreRouter},
     store::{
         config::RaftstoreConfigManager,
-        fsm::{store::StoreMeta, RaftBatchSystem, RaftRouter},
+        fsm::{store::StoreMeta, ApplyRouter, RaftBatchSystem, RaftRouter},
         SnapManagerBuilder, *,
     },
     Result,
@@ -38,10 +39,11 @@ use test_pd_client::TestPdClient;
 use tikv::{
     config::{ConfigController, Module},
     import::SstImporter,
-    server::{raftkv::ReplicaReadLockChecker, Node, Result as ServerResult},
+    server::{raftkv::ReplicaReadLockChecker, MultiRaftServer, Result as ServerResult},
 };
 use tikv_util::{
     config::VersionTrack,
+    sys::disk,
     time::ThreadReadId,
     worker::{Builder as WorkerBuilder, LazyWorker},
 };
@@ -154,11 +156,12 @@ type SimulateChannelTransport = SimulateTransport<ChannelTransport>;
 pub struct NodeCluster {
     trans: ChannelTransport,
     pd_client: Arc<TestPdClient>,
-    nodes: HashMap<u64, Node<TestPdClient, RocksEngine, RaftTestEngine>>,
+    nodes: HashMap<u64, MultiRaftServer<TestPdClient, RocksEngine, RaftTestEngine>>,
     snap_mgrs: HashMap<u64, SnapManager>,
     cfg_controller: HashMap<u64, ConfigController>,
     simulate_trans: HashMap<u64, SimulateChannelTransport>,
     concurrency_managers: HashMap<u64, ConcurrencyManager>,
+    importers: HashMap<u64, Arc<SstImporter<RocksEngine>>>,
     #[allow(clippy::type_complexity)]
     post_create_coprocessor_host: Option<Box<dyn Fn(u64, &mut CoprocessorHost<RocksEngine>)>>,
 }
@@ -173,6 +176,7 @@ impl NodeCluster {
             cfg_controller: HashMap::default(),
             simulate_trans: HashMap::default(),
             concurrency_managers: HashMap::default(),
+            importers: HashMap::default(),
             post_create_coprocessor_host: None,
         }
     }
@@ -208,7 +212,7 @@ impl NodeCluster {
     pub fn get_node(
         &mut self,
         node_id: u64,
-    ) -> Option<&mut Node<TestPdClient, RocksEngine, RaftTestEngine>> {
+    ) -> Option<&mut MultiRaftServer<TestPdClient, RocksEngine, RaftTestEngine>> {
         self.nodes.get_mut(&node_id)
     }
 
@@ -218,6 +222,10 @@ impl NodeCluster {
 
     pub fn get_cfg_controller(&self, node_id: u64) -> Option<&ConfigController> {
         self.cfg_controller.get(&node_id)
+    }
+
+    pub fn get_importer(&self, node_id: u64) -> Option<Arc<SstImporter<RocksEngine>>> {
+        self.importers.get(&node_id).cloned()
     }
 }
 
@@ -232,6 +240,7 @@ impl Simulator for NodeCluster {
         router: RaftRouter<RocksEngine, RaftTestEngine>,
         system: RaftBatchSystem<RocksEngine, RaftTestEngine>,
         _resource_manager: &Option<Arc<ResourceGroupManager>>,
+        _force_partition_mgr: &ForcePartitionRangeManager,
     ) -> ServerResult<u64> {
         assert!(node_id == 0 || !self.nodes.contains_key(&node_id));
         let pd_worker = LazyWorker::new("test-pd-worker");
@@ -248,15 +257,16 @@ impl Simulator for NodeCluster {
             )
             .unwrap();
         let bg_worker = WorkerBuilder::new("background").thread_count(2).create();
-        let mut node = Node::new(
+        let store_config = Arc::new(VersionTrack::new(raft_store));
+        let mut node = MultiRaftServer::new(
             system,
             &cfg.server,
-            Arc::new(VersionTrack::new(raft_store)),
+            store_config.clone(),
             cfg.storage.api_version(),
             Arc::clone(&self.pd_client),
             Arc::default(),
             bg_worker.clone(),
-            None,
+            HealthController::new(),
             None,
         );
 
@@ -273,6 +283,7 @@ impl Simulator for NodeCluster {
             let snap_mgr = SnapManagerBuilder::default()
                 .max_write_bytes_per_sec(cfg.server.snap_io_max_bytes_per_sec.0 as i64)
                 .max_total_size(cfg.server.snap_max_total_size.0)
+                .concurrent_recv_snap_limit(cfg.server.concurrent_recv_snap_limit)
                 .encryption_key_manager(key_manager)
                 .max_per_file_size(cfg.raft_store.max_snapshot_file_raw_size.0)
                 .enable_multi_snapshot_files(true)
@@ -282,14 +293,36 @@ impl Simulator for NodeCluster {
             (snap_mgr, Some(tmp))
         } else {
             let trans = self.trans.core.lock().unwrap();
-            let &(ref snap_mgr, _) = &trans.snap_paths[&node_id];
+            let (snap_mgr, _) = &trans.snap_paths[&node_id];
             (snap_mgr.clone(), None)
         };
 
         self.snap_mgrs.insert(node_id, snap_mgr.clone());
 
         // Create coprocessor.
+        let enable_region_stats_mgr_cb: Arc<dyn Fn() -> bool + Send + Sync> =
+            if cfg.in_memory_engine.enable {
+                Arc::new(|| true)
+            } else {
+                Arc::new(|| false)
+            };
         let mut coprocessor_host = CoprocessorHost::new(router.clone(), cfg.coprocessor.clone());
+
+        // In-memory engine
+        let mut in_memory_engine_config = cfg.in_memory_engine.clone();
+        in_memory_engine_config.expected_region_size = cfg.coprocessor.region_split_size();
+        let in_memory_engine_config = Arc::new(VersionTrack::new(in_memory_engine_config));
+        let in_memory_engine_config_clone = in_memory_engine_config.clone();
+
+        let region_info_accessor = raftstore::RegionInfoAccessor::new(
+            &mut coprocessor_host,
+            enable_region_stats_mgr_cb,
+            Box::new(move || {
+                in_memory_engine_config_clone
+                    .value()
+                    .mvcc_amplification_threshold
+            }),
+        );
 
         if let Some(f) = self.post_create_coprocessor_host.as_ref() {
             f(node_id, &mut coprocessor_host);
@@ -305,25 +338,46 @@ impl Simulator for NodeCluster {
                 SstImporter::new(&cfg.import, dir, None, cfg.storage.api_version(), false).unwrap(),
             )
         };
+        self.importers.insert(node_id, importer.clone());
 
         let local_reader = LocalReader::new(
             engines.kv.clone(),
             StoreMetaDelegate::new(store_meta.clone(), engines.kv.clone()),
             router.clone(),
+            coprocessor_host.clone(),
         );
         let cfg_controller = ConfigController::new(cfg.tikv.clone());
 
         let split_check_runner = SplitCheckRunner::new(
-            Some(store_meta.clone()),
             engines.kv.clone(),
             router.clone(),
             coprocessor_host.clone(),
+            Some(Arc::new(region_info_accessor)),
         );
         let split_scheduler = bg_worker.start("test-split-check", split_check_runner);
         cfg_controller.register(
             Module::Coprocessor,
             Box::new(SplitCheckConfigManager(split_scheduler.clone())),
         );
+        // Spawn a task to update the disk status periodically.
+        {
+            let data_dir = PathBuf::from(engines.kv.path());
+            let rocks_engine = Arc::downgrade(engines.kv.as_inner());
+            let snap_mgr = snap_mgr.clone();
+            bg_worker.spawn_interval_task(std::time::Duration::from_millis(1000), move || {
+                if let Some(rocks_engine) = rocks_engine.upgrade() {
+                    let snap_size = snap_mgr.get_total_snap_size().unwrap();
+                    let kv_size = util::get_engine_cfs_used_size(rocks_engine.as_ref())
+                        .expect("get kv engine size");
+                    let used_size = snap_size + kv_size;
+                    let (capacity, available) = disk::get_disk_space_stats(&data_dir).unwrap();
+
+                    disk::set_disk_capacity(capacity);
+                    disk::set_disk_used_size(used_size);
+                    disk::set_disk_available_size(std::cmp::min(available, capacity - used_size));
+                }
+            });
+        }
 
         node.try_bootstrap_store(engines.clone())?;
         node.start(
@@ -361,25 +415,11 @@ impl Simulator for NodeCluster {
                 .map(|p| p.path().to_str().unwrap().to_owned())
         );
 
-        let region_split_size = cfg.coprocessor.region_split_size();
-        let enable_region_bucket = cfg.coprocessor.enable_region_bucket();
-        let region_bucket_size = cfg.coprocessor.region_bucket_size;
-        let mut raftstore_cfg = cfg.tikv.raft_store;
-        raftstore_cfg.optimize_for(false);
-        raftstore_cfg
-            .validate(
-                region_split_size,
-                enable_region_bucket,
-                region_bucket_size,
-                false,
-            )
-            .unwrap();
-        let raft_store = Arc::new(VersionTrack::new(raftstore_cfg));
         cfg_controller.register(
             Module::Raftstore,
             Box::new(RaftstoreConfigManager::new(
                 node.refresh_config_scheduler(),
-                raft_store,
+                store_config,
             )),
         );
 
@@ -489,7 +529,8 @@ impl Simulator for NodeCluster {
         }
         let mut guard = self.trans.core.lock().unwrap();
         let router = guard.routers.get_mut(&node_id).unwrap();
-        router.read(batch_id, request, cb).unwrap();
+        let read_ctx = ReadContext::new(batch_id, None);
+        router.read(read_ctx, request, cb).unwrap();
     }
 
     fn send_raft_msg(&mut self, msg: raft_serverpb::RaftMessage) -> Result<()> {
@@ -522,6 +563,10 @@ impl Simulator for NodeCluster {
 
     fn get_router(&self, node_id: u64) -> Option<RaftRouter<RocksEngine, RaftTestEngine>> {
         self.nodes.get(&node_id).map(|node| node.get_router())
+    }
+
+    fn get_apply_router(&self, node_id: u64) -> Option<ApplyRouter<RocksEngine>> {
+        self.nodes.get(&node_id).map(|node| node.get_apply_router())
     }
 }
 

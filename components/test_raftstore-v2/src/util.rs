@@ -80,8 +80,14 @@ pub fn create_test_engine(
         bootstrap_store(&raft_engine, cluster_id, store_id).unwrap();
     }
 
-    let builder = KvEngineFactoryBuilder::new(env, &cfg.tikv, cache, key_manager.clone())
-        .sst_recovery_sender(Some(scheduler));
+    let builder = KvEngineFactoryBuilder::new(
+        env,
+        &cfg.tikv,
+        cache,
+        key_manager.clone(),
+        Default::default(),
+    )
+    .sst_recovery_sender(Some(scheduler));
 
     let factory = Box::new(builder.build());
     let rocks_statistics = factory.rocks_statistics();
@@ -198,17 +204,31 @@ pub fn wait_for_synced(
         .get(&node_id)
         .unwrap()
         .clone();
-    let leader = cluster.leader_of_region(region_id).unwrap();
-    let epoch = cluster.get_region_epoch(region_id);
-    let mut ctx = Context::default();
-    ctx.set_region_id(region_id);
-    ctx.set_peer(leader);
-    ctx.set_region_epoch(epoch);
-    let snap_ctx = SnapContext {
-        pb_ctx: &ctx,
-        ..Default::default()
+
+    let mut count = 0;
+    let snapshot = loop {
+        count += 1;
+        let leader = cluster.leader_of_region(region_id).unwrap();
+        let epoch = cluster.get_region_epoch(region_id);
+        let mut ctx = Context::default();
+        ctx.set_region_id(region_id);
+        ctx.set_peer(leader);
+        ctx.set_region_epoch(epoch);
+        let snap_ctx = SnapContext {
+            pb_ctx: &ctx,
+            ..Default::default()
+        };
+        match storage.snapshot(snap_ctx) {
+            Ok(s) => break s,
+            Err(e) => {
+                if count <= 5 {
+                    continue;
+                }
+                panic!("all retry failed: {:?}", e);
+            }
+        }
     };
-    let snapshot = storage.snapshot(snap_ctx).unwrap();
+
     let txn_ext = snapshot.txn_ext.clone().unwrap();
     for retry in 0..10 {
         if txn_ext.is_max_ts_synced() {

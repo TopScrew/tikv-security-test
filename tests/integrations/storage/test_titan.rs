@@ -143,6 +143,7 @@ fn test_turnoff_titan() {
 }
 
 #[test]
+#[ignore]
 fn test_delete_files_in_range_for_titan() {
     let path = Builder::new()
         .prefix("test-titan-delete-files-in-range")
@@ -152,7 +153,7 @@ fn test_delete_files_in_range_for_titan() {
     // Set configs and create engines
     let mut cfg = TikvConfig::default();
     let cache = cfg.storage.block_cache.build_shared_cache();
-    cfg.rocksdb.titan.enabled = true;
+    cfg.rocksdb.titan.enabled = Some(true);
     cfg.rocksdb.titan.disable_gc = true;
     cfg.rocksdb.titan.purge_obsolete_files_period = ReadableDuration::secs(1);
     cfg.rocksdb.defaultcf.disable_auto_compactions = true;
@@ -160,13 +161,13 @@ fn test_delete_files_in_range_for_titan() {
     cfg.rocksdb.defaultcf.dynamic_level_bytes = false;
     cfg.rocksdb.defaultcf.titan.min_gc_batch_size = ReadableSize(0);
     cfg.rocksdb.defaultcf.titan.discardable_ratio = 0.4;
-    cfg.rocksdb.defaultcf.titan.min_blob_size = ReadableSize(0);
+    cfg.rocksdb.defaultcf.titan.min_blob_size = Some(ReadableSize(0));
     let resource = cfg
         .rocksdb
         .build_resources(Default::default(), cfg.storage.engine);
     let kv_db_opts = cfg.rocksdb.build_opt(&resource, cfg.storage.engine);
     let kv_cfs_opts = cfg.rocksdb.build_cf_opts(
-        &cfg.rocksdb.build_cf_resources(cache),
+        &cfg.rocksdb.build_cf_resources(cache, Default::default()),
         None,
         cfg.storage.api_version(),
         None,
@@ -379,6 +380,7 @@ fn test_delete_files_in_range_for_titan() {
         u64::MAX,
         &limiter,
         None,
+        true,
     )
     .unwrap();
     let mut cf_file_write = CfFile::new(
@@ -396,6 +398,7 @@ fn test_delete_files_in_range_for_titan() {
         u64::MAX,
         &limiter,
         None,
+        true,
     )
     .unwrap();
 

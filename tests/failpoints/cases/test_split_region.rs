@@ -75,7 +75,7 @@ fn test_meta_inconsistency() {
     let region = cluster.get_region(b"");
     cluster.must_split(&region, b"k5");
 
-    // Scheduler a larger peed id heartbeat msg to trigger peer destroy for peer
+    // Scheduler a larger peer id heartbeat msg to trigger peer destroy for peer
     // 1003, pause it before the meta.lock operation so new region insertions by
     // region split could go first.
     // Thus a inconsistency could happen because the destroy is handled
@@ -722,7 +722,7 @@ fn test_split_continue_when_destroy_peer_after_mem_check() {
     })
     .unwrap();
 
-    // Resum region 1000 processing and wait till it's destroyed.
+    // Resume region 1000 processing and wait till it's destroyed.
     fail::remove(before_check_snapshot_1000_2_fp);
     destroy_rx.recv_timeout(Duration::from_secs(3)).unwrap();
 
@@ -1161,6 +1161,8 @@ fn test_split_with_concurrent_pessimistic_locking() {
 
 #[test]
 fn test_split_pessimistic_locks_with_concurrent_prewrite() {
+    let peer_size_limit = 512 << 10;
+    let instance_size_limit = 100 << 20;
     let mut cluster = new_server_cluster(0, 2);
     cluster.cfg.pessimistic_txn.pipelined = true;
     cluster.cfg.pessimistic_txn.in_memory = true;
@@ -1216,10 +1218,11 @@ fn test_split_pessimistic_locks_with_concurrent_prewrite() {
     {
         let mut locks = txn_ext.pessimistic_locks.write();
         locks
-            .insert(vec![
-                (Key::from_raw(b"a"), lock_a),
-                (Key::from_raw(b"c"), lock_c),
-            ])
+            .insert(
+                vec![(Key::from_raw(b"a"), lock_a), (Key::from_raw(b"c"), lock_c)],
+                peer_size_limit,
+                instance_size_limit,
+            )
             .unwrap();
     }
 
@@ -1535,8 +1538,7 @@ impl Filter for TeeFilter {
 // 2. the splitted region set has_dirty_data be true in `apply_snapshot`
 // 3. the splitted region schedule tablet trim task in `on_applied_snapshot`
 //    with tablet index 5
-// 4. the splitted region received a snapshot sent from its
-//    leader
+// 4. the splitted region received a snapshot sent from its leader
 // 5. after finishing applying this snapshot, the tablet index in storage
 //    changed to 6
 // 6. tablet trim complete and callbacked to raftstore

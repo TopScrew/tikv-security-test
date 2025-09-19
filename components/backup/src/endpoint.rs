@@ -12,8 +12,7 @@ use async_channel::SendError;
 use causal_ts::{CausalTsProvider, CausalTsProviderImpl};
 use concurrency_manager::ConcurrencyManager;
 use engine_traits::{name_to_cf, raw_ttl::ttl_current_ts, CfName, KvEngine, SstCompressionType};
-use external_storage::{BackendConfig, HdfsConfig};
-use external_storage_export::{create_storage, ExternalStorage};
+use external_storage::{create_storage, BackendConfig, ExternalStorage, HdfsConfig};
 use futures::{channel::mpsc::*, executor::block_on};
 use kvproto::{
     brpb::*,
@@ -39,6 +38,7 @@ use tikv_util::{
     box_err, debug, error, error_unknown,
     future::RescheduleChecker,
     impl_display_as_debug, info,
+    resizable_threadpool::ResizableRuntime,
     store::find_peer,
     time::{Instant, Limiter},
     warn,
@@ -50,7 +50,7 @@ use txn_types::{Key, Lock, TimeStamp};
 use crate::{
     metrics::*,
     softlimit::{CpuStatistics, SoftLimit, SoftLimitByCpu},
-    utils::{ControlThreadPool, KeyValueCodec},
+    utils::KeyValueCodec,
     writer::{BackupWriterBuilder, CfNameWrap},
     Error, *,
 };
@@ -371,7 +371,7 @@ impl BackupRange {
         let snapshot = match engine.snapshot(snap_ctx) {
             Ok(s) => s,
             Err(e) => {
-                error!(?e; "backup snapshot failed");
+                warn!("backup snapshot failed"; "err" => ?e, "ctx" => ?ctx);
                 return Err(e.into());
             }
         };
@@ -406,7 +406,7 @@ impl BackupRange {
             RescheduleChecker::new(tokio::task::yield_now, TASK_YIELD_DURATION);
         loop {
             if let Err(e) = scanner.scan_entries(&mut batch) {
-                error!(?e; "backup scan entries failed");
+                warn!("backup scan entries failed"; "err" => ?e, "ctx" => ?ctx);
                 return Err(e.into());
             };
             if batch.is_empty() {
@@ -416,7 +416,7 @@ impl BackupRange {
 
             let entries = batch.drain();
             if writer.need_split_keys() {
-                let this_end_key = entries.as_slice().get(0).map_or_else(
+                let this_end_key = entries.as_slice().first().map_or_else(
                     || Err(Error::Other(box_err!("get entry error: nothing in batch"))),
                     |x| {
                         x.to_key().map(|k| k.into_raw().unwrap()).map_err(|e| {
@@ -447,7 +447,7 @@ impl BackupRange {
 
             // Build sst files.
             if let Err(e) = writer.write(entries, true) {
-                error_unknown!(?e; "backup build sst failed");
+                warn!("backup build sst failed"; "err" => ?e, "ctx" => ?ctx);
                 return Err(e);
             }
             if resource_limiter.is_some() {
@@ -572,7 +572,7 @@ impl BackupRange {
         ) {
             Ok(w) => w,
             Err(e) => {
-                error_unknown!(?e; "backup writer failed");
+                warn!("backup writer failed"; "err" => ?e, "region" => ?self.region);
                 return Err(e);
             }
         };
@@ -589,7 +589,7 @@ impl BackupRange {
         let engine_snapshot = match engine.snapshot(snap_ctx) {
             Ok(s) => s,
             Err(e) => {
-                error!(?e; "backup raw kv snapshot failed");
+                warn!("backup raw kv snapshot failed"; "err" => ?e, "ctx" => ?ctx);
                 return Err(e.into());
             }
         };
@@ -705,7 +705,7 @@ impl SoftLimitKeeper {
 /// It coordinates backup tasks and dispatches them to different workers.
 pub struct Endpoint<E: Engine, R: RegionInfoProvider + Clone + 'static> {
     store_id: u64,
-    pool: RefCell<ControlThreadPool>,
+    pool: RefCell<ResizableRuntime>,
     io_pool: Runtime,
     tablets: LocalTablets<E::Local>,
     config_manager: ConfigManager,
@@ -714,7 +714,6 @@ pub struct Endpoint<E: Engine, R: RegionInfoProvider + Clone + 'static> {
     api_version: ApiVersion,
     causal_ts_provider: Option<Arc<CausalTsProviderImpl>>, // used in rawkv apiv2 only
     resource_ctl: Option<Arc<ResourceGroupManager>>,
-
     pub(crate) engine: E,
     pub(crate) region_info: R,
 }
@@ -847,7 +846,6 @@ impl<R: RegionInfoProvider> Progress<R> {
             }),
         );
         if let Err(e) = res {
-            // TODO: handle error.
             error!(?e; "backup seek region failed");
         }
 
@@ -880,7 +878,12 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
         causal_ts_provider: Option<Arc<CausalTsProviderImpl>>,
         resource_ctl: Option<Arc<ResourceGroupManager>>,
     ) -> Endpoint<E, R> {
-        let pool = ControlThreadPool::new();
+        let pool = ResizableRuntime::new(
+            config.num_threads,
+            "bkwkr",
+            Box::new(utils::create_tokio_runtime),
+            Box::new(|new_size| BACKUP_THREAD_POOL_SIZE_GAUGE.set(new_size as i64)),
+        );
         let rt = utils::create_tokio_runtime(config.io_thread_size, "backup-io").unwrap();
         let config_manager = ConfigManager(Arc::new(RwLock::new(config)));
         let softlimit = SoftLimitKeeper::new(config_manager.clone());
@@ -950,7 +953,8 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
             loop {
                 // when get the guard, release it until we finish scanning a batch,
                 // because if we were suspended during scanning,
-                // the region info have higher possibility to change (then we must compensate that by the fine-grained backup).
+                // the region info have higher possibility to change (then we must compensate
+                // that by the fine-grained backup).
                 let guard = limit.guard().await;
                 if let Err(e) = guard {
                     warn!("failed to retrieve limit guard, omitting."; "err" => %e);
@@ -960,14 +964,16 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                     // It is critical to speed up backup, otherwise workers are
                     // blocked by each other.
                     //
-                    // If we use [tokio::sync::Mutex] here, until we give back the control flow to the scheduler
-                    // or tasks waiting for the lock won't be waked up due to the characteristic of the runtime...
+                    // If we use [tokio::sync::Mutex] here, until we give back the control flow to
+                    // the scheduler or tasks waiting for the lock won't be
+                    // waked up due to the characteristic of the runtime...
                     //
                     // The worst case is when using `noop` backend:
-                    // the task seems never yielding and in fact the backup would executing sequentially.
+                    // the task seems never yielding and in fact the backup would executing
+                    // sequentially.
                     //
-                    // Anyway, even tokio itself doesn't recommend to use it unless the lock guard needs to be `Send`.
-                    // (See https://tokio.rs/tokio/tutorial/shared-state)
+                    // Anyway, even tokio itself doesn't recommend to use it unless the lock guard
+                    // needs to be `Send`. (See https://tokio.rs/tokio/tutorial/shared-state)
                     // Use &mut and mark the type for making rust-analyzer happy.
                     let progress: &mut Progress<_> = &mut prs.lock().unwrap();
                     match progress.forward(batch_size, request.replica_read) {
@@ -977,8 +983,9 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                 };
 
                 for brange in batch {
-                    // wake up the scheduler for each loop for awaking tasks waiting for some lock or channels.
-                    // because the softlimit permit is held by current task, there isn't risk of being suspended for long time.
+                    // wake up the scheduler for each loop for awaking tasks waiting for some lock
+                    // or channels. because the softlimit permit is held by
+                    // current task, there isn't risk of being suspended for long time.
                     tokio::task::yield_now().await;
                     let engine = engine.clone();
                     if request.cancel.load(Ordering::SeqCst) {
@@ -987,7 +994,8 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                     }
                     // TODO: make file_name unique and short
                     let key = brange.start_key.clone().and_then(|k| {
-                        // use start_key sha256 instead of start_key to avoid file name too long os error
+                        // use start_key sha256 instead of start_key to avoid file name too long os
+                        // error
                         let input = brange.codec.decode_backup_key(Some(k)).unwrap_or_default();
                         file_system::sha256(&input).ok().map(hex::encode)
                     });
@@ -1026,7 +1034,8 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                             sst_max_size,
                             request.cipher.clone(),
                         );
-                        with_resource_limiter(brange.backup(
+                        with_resource_limiter(
+                            brange.backup(
                                 writer_builder,
                                 engine,
                                 concurrency_manager.clone(),
@@ -1035,15 +1044,17 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                                 saver_tx.clone(),
                                 _backend.name(),
                                 resource_limiter.clone(),
-                            ), resource_limiter.clone())
-                            .await
+                            ),
+                            resource_limiter.clone(),
+                        )
+                        .await
                     };
                     match stat {
                         Err(err) => {
-                            error_unknown!(%err; "error during backup"; "region" => ?brange.region,);
+                            warn!("error during backup"; "region" => ?brange.region, "err" => %err);
                             let mut resp = BackupResponse::new();
                             resp.set_error(err.into());
-                            if let Err(err) =  resp_tx.unbounded_send(resp) {
+                            if let Err(err) = resp_tx.unbounded_send(resp) {
                                 warn!("failed to send response"; "err" => ?err)
                             }
                         }
@@ -1320,7 +1331,7 @@ pub mod tests {
     use api_version::{api_v2::RAW_KEY_PREFIX, dispatch_api_version, KvFormat, RawValue};
     use collections::HashSet;
     use engine_traits::MiscExt;
-    use external_storage_export::{make_local_backend, make_noop_backend};
+    use external_storage::{make_local_backend, make_noop_backend};
     use file_system::{IoOp, IoRateLimiter, IoType};
     use futures::{executor::block_on, stream::StreamExt};
     use kvproto::metapb;
@@ -1351,9 +1362,10 @@ pub mod tests {
     impl MockRegionInfoProvider {
         pub fn new(encode_key: bool) -> Self {
             MockRegionInfoProvider {
-                regions: Arc::new(Mutex::new(RegionCollector::new(Arc::new(RwLock::new(
-                    HashSet::default(),
-                ))))),
+                regions: Arc::new(Mutex::new(RegionCollector::new(
+                    Arc::new(RwLock::new(HashSet::default())),
+                    Box::new(|| 0),
+                ))),
                 cancel: None,
                 need_encode_key: encode_key,
             }
@@ -1502,8 +1514,12 @@ pub mod tests {
         use std::thread::sleep;
 
         let counter = Arc::new(AtomicU32::new(0));
-        let mut pool = ControlThreadPool::new();
-        pool.adjust_with(3);
+        let mut pool = ResizableRuntime::new(
+            3,
+            "bkwkr",
+            Box::new(utils::create_tokio_runtime),
+            Box::new(|new_size: usize| BACKUP_THREAD_POOL_SIZE_GAUGE.set(new_size as i64)),
+        );
 
         for i in 0..8 {
             let ctr = counter.clone();
@@ -1595,7 +1611,7 @@ pub mod tests {
             };
 
         // Test whether responses contain correct range.
-        #[allow(clippy::blocks_in_if_conditions)]
+        #[allow(clippy::blocks_in_conditions)]
         let test_handle_backup_task_range =
             |start_key: &[u8], end_key: &[u8], expect: Vec<(&[u8], &[u8])>| {
                 let tmp = TempDir::new().unwrap();
@@ -1837,7 +1853,7 @@ pub mod tests {
             };
 
         // Test whether responses contain correct range.
-        #[allow(clippy::blocks_in_if_conditions)]
+        #[allow(clippy::blocks_in_conditions)]
         let test_handle_backup_task_ranges =
             |sub_ranges: Vec<(&[u8], &[u8])>, expect: Vec<(&[u8], &[u8])>| {
                 let tmp = TempDir::new().unwrap();
@@ -1994,7 +2010,7 @@ pub mod tests {
         let mut prs = Progress::new_with_ranges(
             endpoint.store_id,
             ranges,
-            endpoint.region_info,
+            endpoint.region_info.clone(),
             KeyValueCodec::new(false, ApiVersion::V1, ApiVersion::V1),
             engine_traits::CF_DEFAULT,
         );
@@ -2540,20 +2556,20 @@ pub mod tests {
         endpoint.get_config_manager().set_num_threads(15);
         let (task, _) = Task::new(req.clone(), tx.clone()).unwrap();
         endpoint.handle_backup_task(task);
-        assert!(endpoint.pool.borrow().size == 15);
+        assert!(endpoint.pool.borrow().size() == 15);
 
         // shrink thread pool only if there are too many idle threads
         endpoint.get_config_manager().set_num_threads(10);
         req.set_start_key(vec![b'2']);
         let (task, _) = Task::new(req.clone(), tx.clone()).unwrap();
         endpoint.handle_backup_task(task);
-        assert!(endpoint.pool.borrow().size == 15);
+        assert!(endpoint.pool.borrow().size() == 10);
 
         endpoint.get_config_manager().set_num_threads(3);
         req.set_start_key(vec![b'3']);
         let (task, _) = Task::new(req, tx).unwrap();
         endpoint.handle_backup_task(task);
-        assert!(endpoint.pool.borrow().size == 3);
+        assert!(endpoint.pool.borrow().size() == 3);
 
         // make sure all tasks can finish properly.
         let responses = block_on(rx.collect::<Vec<_>>());
@@ -2562,8 +2578,12 @@ pub mod tests {
         // for testing whether dropping the pool before all tasks finished causes panic.
         // but the panic must be checked manually. (It may panic at tokio runtime
         // threads)
-        let mut pool = ControlThreadPool::new();
-        pool.adjust_with(1);
+        let mut pool = ResizableRuntime::new(
+            1,
+            "bkwkr",
+            Box::new(utils::create_tokio_runtime),
+            Box::new(|new_size: usize| BACKUP_THREAD_POOL_SIZE_GAUGE.set(new_size as i64)),
+        );
         pool.spawn(async { tokio::time::sleep(Duration::from_millis(100)).await });
         pool.adjust_with(2);
         drop(pool);
@@ -2574,8 +2594,8 @@ pub mod tests {
     fn test_backup_file_name() {
         let region = metapb::Region::default();
         let store_id = 1;
-        let test_cases = vec!["s3", "local", "gcs", "azure", "hdfs"];
-        let test_target = vec![
+        let test_cases = ["s3", "local", "gcs", "azure", "hdfs"];
+        let test_target = [
             "1/0_0_000",
             "1/0_0_000",
             "1_0_0_000",
@@ -2594,7 +2614,7 @@ pub mod tests {
             assert_eq!(target.to_string(), prefix_arr.join(delimiter));
         }
 
-        let test_target = vec!["1/0_0", "1/0_0", "1_0_0", "1_0_0", "1_0_0"];
+        let test_target = ["1/0_0", "1/0_0", "1_0_0", "1_0_0", "1_0_0"];
         for (storage_name, target) in test_cases.iter().zip(test_target.iter()) {
             let key = None;
             let filename = backup_file_name(store_id, &region, key, storage_name);
